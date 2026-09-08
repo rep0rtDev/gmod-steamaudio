@@ -77,7 +77,7 @@ index 89a3a70..741f34d 100644
              }
          },
 diff --git a/core/src/core/CMakeLists.txt b/core/src/core/CMakeLists.txt
-index bff7f30..9fe47ea 100644
+index bff7f30..4e1fe04 100644
 --- a/core/src/core/CMakeLists.txt
 +++ b/core/src/core/CMakeLists.txt
 @@ -1,4 +1,4 @@
@@ -96,6 +96,32 @@ index bff7f30..9fe47ea 100644
  
  if (IPL_OS_WINDOWS)
      target_link_libraries(core PUBLIC delayimp)
+@@ -679,7 +682,10 @@ if (IPL_OS_LINUX)
+ endif()
+ 
+ if (IPL_OS_WINDOWS AND IPL_CPU_X64 AND BUILD_SHARED_LIBS)
+-    set_target_properties(phonon PROPERTIES LINK_FLAGS "/DELAYLOAD:opencl.dll /DELAYLOAD:gpuutilities.dll /DELAYLOAD:trueaudionext.dll")
++    target_link_options(phonon PRIVATE /DELAYLOAD:opencl.dll)
++    if (STEAMAUDIO_ENABLE_TRUEAUDIONEXT)
++        target_link_options(phonon PRIVATE /DELAYLOAD:gpuutilities.dll /DELAYLOAD:trueaudionext.dll)
++    endif()
+ endif()
+ 
+ if (IPL_OS_LINUX AND BUILD_SHARED_LIBS AND (NOT IPL_CPU_ARMV8))
+@@ -1019,10 +1025,10 @@ install(
+     DESTINATION include
+ )
+ 
+-if (IPL_OS_WINDOWS AND IPL_CPU_X64)
++if (IPL_OS_WINDOWS AND IPL_CPU_X64 AND STEAMAUDIO_ENABLE_TRUEAUDIONEXT)
+     install(
+-        FILES       ${CMAKE_HOME_DIRECTORY}/deps/trueaudionext/bin/windows-x64/$<LOWER_CASE:$<CONFIG>>/TrueAudioNext.dll
+-                    ${CMAKE_HOME_DIRECTORY}/deps/trueaudionext/bin/windows-x64/$<LOWER_CASE:$<CONFIG>>/GPUUtilities.dll
++        FILES       ${CMAKE_HOME_DIRECTORY}/deps/trueaudionext/bin/windows-x64/$<IF:$<CONFIG:Debug>,debug,release>/TrueAudioNext.dll
++                    ${CMAKE_HOME_DIRECTORY}/deps/trueaudionext/bin/windows-x64/$<IF:$<CONFIG:Debug>,debug,release>/GPUUtilities.dll
+         DESTINATION lib/${IPL_BIN_SUBDIR}
+     )
+ endif()
 diff --git a/core/src/core/api_baking.cpp b/core/src/core/api_baking.cpp
 index ebe24e5..9c5e93e 100644
 --- a/core/src/core/api_baking.cpp
