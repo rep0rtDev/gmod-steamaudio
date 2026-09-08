@@ -126,6 +126,7 @@ private:
     struct BakeJob {
         std::shared_ptr<const BspGeometry> geometry;
         BackendDevices devices;
+        std::unique_ptr<IBackend> backendOwner;
         std::shared_ptr<SceneBuilder> sceneOwner;
         IPLScene scene = nullptr;
         IPLProbeBatch batch = nullptr;

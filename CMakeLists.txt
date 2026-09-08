@@ -65,12 +65,15 @@ message(STATUS "gmod-steamaudio: building ${SA_MODULE_NAME}.dll (${SA_ARCH_BITS}
 add_library(sa_compile_options INTERFACE)
 if(MSVC)
     target_compile_options(sa_compile_options INTERFACE
-        /W4 /permissive- /Zc:__cplusplus /EHsc /utf-8
+        /W4 /permissive- /Zc:__cplusplus /EHsc /utf-8 /Zi
         /wd4200 # zero-sized array in struct (Source SDK headers)
         /wd4324 # structure padded due to alignas
     )
     target_compile_definitions(sa_compile_options INTERFACE
         _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_link_options(sa_compile_options INTERFACE /DEBUG:FULL
+        $<$<NOT:$<CONFIG:Debug>>:/OPT:REF>
+        $<$<NOT:$<CONFIG:Debug>>:/OPT:ICF>)
     if(SA_WARNINGS_AS_ERRORS)
         target_compile_options(sa_compile_options INTERFACE /WX)
     endif()

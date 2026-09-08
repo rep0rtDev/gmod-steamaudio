@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <fstream>
 #include <thread>
+#include <type_traits>
 #include "mixing/SoundSource.h"
 #include "steamaudio/Config.h"
 #include "steamaudio/HRTFRenderer.h"
@@ -115,6 +116,39 @@ float IPLCALL TestDistanceCallback(IPLfloat32 distanceMeters, void* userData)
     return SourceDistanceGain(*distMult, distanceMeters * 52.49f);
 }
 
+struct BakeDeviceObserver {
+    using Function = std::decay_t<decltype(iplReflectionsBakerBake)>;
+    Function original = iplReflectionsBakerBake;
+    BackendDevices live;
+    std::atomic<bool> observed{false}, shared{false}, release{false};
+    inline static BakeDeviceObserver* active = nullptr;
+
+    explicit BakeDeviceObserver(const BackendDevices& devices) : live(devices)
+    {
+        active = this;
+        const_cast<Function&>(iplReflectionsBakerBake) = &Dispatch;
+    }
+    ~BakeDeviceObserver()
+    {
+        const_cast<Function&>(iplReflectionsBakerBake) = original;
+        active = nullptr;
+    }
+    static void IPLCALL Dispatch(IPLContext context, IPLReflectionsBakeParams* params,
+                                 IPLProgressCallback progress, void* userData)
+    {
+        auto& self = *active;
+        const bool unsafe = !params || params->sceneType != IPL_SCENETYPE_RADEONRAYS ||
+                            !params->openCLDevice || !params->radeonRaysDevice ||
+                            params->openCLDevice == self.live.openCL || params->radeonRaysDevice == self.live.radeonRays;
+        self.shared.store(unsafe, std::memory_order_relaxed);
+        self.observed.store(true, std::memory_order_release);
+        if (unsafe) return;
+        while (!self.release.load(std::memory_order_acquire))
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        self.original(context, params, progress, userData);
+    }
+};
+
 } // namespace
 
 // In-game path: the direct-path parameters come from a Steam Audio simulator
@@ -145,6 +179,105 @@ SA_TEST(GpuBackend_DefaultEnumerationKeepsPlainOpenCLDevices)
     if (!initialized) std::printf("    GPU initialization: %s\n", error.c_str());
     SA_CHECK(initialized);
     SA_CHECK(backend.Devices().radeonRays != nullptr || backend.Devices().tan != nullptr);
+}
+
+SA_TEST(ReflectionBake_GpuDeviceIsolatedFromLiveSceneUpdates)
+{
+    const char* dir = PhononDir();
+    if (!dir || !std::getenv("SA_TEST_GPU"))
+        throw satest::Skipped{"SA_PHONON_DIR and SA_TEST_GPU are required for GPU bake isolation"};
+    StaticConfig fixed;
+    fixed.maxSources = 2;
+    fixed.maxRays = 512;
+    fixed.maxIrDuration = 0.25f;
+    fixed.simulationThreads = 1;
+    fixed.enableTan = false;
+    fixed.gpuComputeUnits = 0;
+    fixed.sceneType = SceneTypePreference::RadeonRays;
+    PhononContext context;
+    std::string error;
+    SA_CHECK(context.Initialize(fixed, {dir}, error));
+    GPUBackend backend;
+    SA_CHECK(backend.Initialize(context, fixed, error));
+    const BackendDevices devices = backend.Devices();
+    SA_CHECK(devices.sceneType == IPL_SCENETYPE_RADEONRAYS && devices.radeonRays && devices.openCL);
+    const char* map = std::getenv("SA_TEST_BSP");
+    const bool realMap = map && *map;
+    std::vector<uint8_t> bytes;
+    if (realMap) {
+        std::ifstream file(map, std::ios::binary | std::ios::ate);
+        SA_CHECK(file.good());
+        const auto size = file.tellg();
+        SA_CHECK(size > 0 && size < (1 << 29));
+        bytes.resize(static_cast<size_t>(size));
+        file.seekg(0);
+        SA_CHECK(static_cast<bool>(file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()))));
+    } else {
+        bytes = satest::MakeRoomBsp();
+    }
+    auto geometry = std::make_shared<BspGeometry>();
+    SA_CHECK(ParseBsp(bytes.data(), bytes.size(), CoordinateConverter{}, MaterialLibrary{}, {}, *geometry));
+    SceneBuilder live;
+    SA_CHECK(live.Initialize(context, devices));
+    SA_CHECK(live.AddStaticMesh(geometry->world, "gpu_live"));
+    live.Commit();
+    Simulator simulator;
+    SA_CHECK(simulator.Initialize(context, devices, fixed, error));
+    simulator.SetScene(live.Scene());
+    BakeDeviceObserver observer(devices);
+    ReflectionSimulator reflections;
+    SA_CHECK(reflections.Initialize(context, simulator, fixed, devices));
+    RuntimeConfig runtime;
+    runtime.probeSpacing = realMap ? 4.f : 2.f;
+    runtime.bakeRays = 256;
+    runtime.bakeBounces = 4;
+    runtime.bakeDuration = 0.2f;
+    runtime.ambisonicOrder = 1;
+    SA_CHECK(reflections.StartBake(geometry, runtime, "", {}));
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (!observer.observed.load(std::memory_order_acquire) && reflections.BakeInProgress() &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    observer.release.store(true, std::memory_order_release);
+    SA_CHECK(observer.observed.load(std::memory_order_acquire));
+    SA_CHECK(!observer.shared.load(std::memory_order_relaxed));
+    int updates = 0;
+    bool cancelRequested = false;
+    while (reflections.BakeInProgress() && std::chrono::steady_clock::now() < deadline) {
+        if (updates < 24) {
+            MeshData extra;
+            IPLMaterial material{};
+            for (float& band : material.absorption) band = 0.5f;
+            const int index = extra.AddMaterial(material);
+            const float x = 20.f + static_cast<float>(updates);
+            extra.AddTriangle({x, 0.f, 0.f}, {x, 2.f, 0.f}, {x, 0.f, 2.f}, index);
+            SA_CHECK(live.AddStaticMesh(extra, "gpu_live_update"));
+            live.Commit();
+            ++updates;
+        }
+        const BakeStatus status = reflections.Status();
+        if (realMap && !cancelRequested && status.completedProbes >= 32 && status.completedProbes < status.probes) {
+            reflections.CancelBake();
+            cancelRequested = true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    SA_CHECK(!reflections.BakeInProgress());
+    SA_CHECK(updates > 0);
+    const BakeStatus status = reflections.Status();
+    if (cancelRequested) {
+        SA_CHECK(status.phase == BakePhase::Cancelled);
+        SA_CHECK(!reflections.PollBake());
+    } else {
+        SA_CHECK(reflections.PollBake());
+        SA_CHECK(reflections.HasBakedData());
+    }
+    SA_CHECK(status.sceneType == IPL_SCENETYPE_RADEONRAYS);
+    reflections.Shutdown();
+    SA_CHECK(live.AddStaticMesh(geometry->world, "gpu_live_after_bake"));
+    live.Commit();
+    std::printf("    isolated GPU bake: %d live BVH updates, %d/%d probes, cancellation=%d\n",
+                updates, status.completedProbes, status.probes, cancelRequested ? 1 : 0);
 }
 
 SA_TEST(HrtfRenderer_SimulatedDirectPathKeepsLevel)

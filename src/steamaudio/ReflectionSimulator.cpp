@@ -15,6 +15,7 @@
 #endif
 
 #include "PhononContext.h"
+#include "GPUBackend.h"
 #include "Simulator.h"
 #include "steamaudio/BspGeometry.h"
 #include "mixing/SoundSource.h"
@@ -372,6 +373,27 @@ try {
     if (!ctx || !ctx->IsValid()) {
         FinishBake(false, false, "Steam Audio context unavailable");
         return;
+    }
+    if (job->devices.sceneType == IPL_SCENETYPE_RADEONRAYS) {
+        SetPhase(BakePhase::Preparing, "Creating an isolated GPU bake device");
+        StaticConfig bakeConfig = m_static;
+        bakeConfig.sceneType = SceneTypePreference::RadeonRays;
+        bakeConfig.enableTan = false;
+        bakeConfig.gpuComputeUnits = 0;
+        auto backend = std::make_unique<GPUBackend>();
+        std::string error;
+        const bool ready = backend->Initialize(*ctx, bakeConfig, error);
+        const BackendDevices& devices = backend->Devices();
+        if (!ready || devices.sceneType != IPL_SCENETYPE_RADEONRAYS || !devices.openCL || !devices.radeonRays ||
+            devices.openCL == job->devices.openCL || devices.radeonRays == job->devices.radeonRays) {
+            if (error.empty()) error = "GPU bake device is not isolated from the live scene";
+            SA_LOGE("Cannot initialize GPU bake resources: %s", error.c_str());
+            FinishBake(false, false, error.c_str());
+            return;
+        }
+        job->devices = devices;
+        job->backendOwner = std::move(backend);
+        SA_LOGI("Baking uses isolated Radeon Rays/OpenCL resources");
     }
     job->sceneOwner = std::make_shared<SceneBuilder>();
     if (!job->sceneOwner->Initialize(*ctx, job->devices) ||
