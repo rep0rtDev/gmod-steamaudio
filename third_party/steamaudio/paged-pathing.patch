@@ -764,6 +764,48 @@ index d459ea5..1219dec 100644
      // Finds the shortest path from the start probe to the end probe. Intended for use when recalculating paths
      // on the fly.
      ProbePath findShortestPath(const IScene& scene,
+diff --git a/core/src/core/radeonrays_scene.cpp b/core/src/core/radeonrays_scene.cpp
+index 2bd5390..e27cb4c 100644
+--- a/core/src/core/radeonrays_scene.cpp
++++ b/core/src/core/radeonrays_scene.cpp
+@@ -1,5 +1,5 @@
+ //
+-// Copyright 2017-2023 Valve Corporation.
++// Copyright 2017-2023 Valve Corporation. Modified for gmod-steamaudio: empty scene synchronization, 2026.
+ //
+ // Licensed under the Apache License, Version 2.0 (the "License");
+ // you may not use this file except in compliance with the License.
+@@ -92,9 +92,9 @@ void RadeonRaysScene::removeStaticMesh(shared_ptr<IStaticMesh> staticMesh)
+ 
+ void RadeonRaysScene::commit()
+ {
++    mRadeonRays->api()->DetachAll();
+     if (numStaticMeshes() > 0)
+     {
+-        mRadeonRays->api()->DetachAll();
+         for (const auto& staticMesh : mStaticMeshes)
+         {
+             mRadeonRays->api()->AttachShape(static_cast<RadeonRaysStaticMesh*>(staticMesh.get())->shape());
+diff --git a/core/src/core/radeonrays_scene.h b/core/src/core/radeonrays_scene.h
+index 4334da1..aec2d68 100644
+--- a/core/src/core/radeonrays_scene.h
++++ b/core/src/core/radeonrays_scene.h
+@@ -1,5 +1,5 @@
+ //
+-// Copyright 2017-2023 Valve Corporation.
++// Copyright 2017-2023 Valve Corporation. Modified for gmod-steamaudio: scene revision tracking, 2026.
+ //
+ // Licensed under the Apache License, Version 2.0 (the "License");
+ // you may not use this file except in compliance with the License.
+@@ -133,7 +133,7 @@ public:
+     // TODO: Implement this method.
+     virtual uint32_t version() const
+     {
+-        return 0;
++        return mCPUScene->version();
+     }
+ 
+ private:
 diff --git a/core/src/core/path_simulator.cpp b/core/src/core/path_simulator.cpp
 index 11a0074..14ae140 100644
 --- a/core/src/core/path_simulator.cpp

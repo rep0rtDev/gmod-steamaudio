@@ -69,6 +69,7 @@ struct StaticConfig {
 // Fields that can change at any time without re-initialization.
 struct RuntimeConfig {
     bool enabled = true;
+    bool physicalAcoustics = true;
     bool hrtf = true;
     int32_t hrtfInterpolation = 1;    // 0 nearest, 1 bilinear
     bool reflections = true;

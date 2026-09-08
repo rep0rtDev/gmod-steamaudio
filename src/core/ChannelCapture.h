@@ -87,6 +87,7 @@ struct CaptureSlot {
     std::atomic<uint32_t> inputRate{0};      // derived from rateScaleFix
     std::atomic<uint32_t> engineMasterVol{255};
     std::atomic<float> engineGain{1.f};      // engine's own distance/obscured gain (fallback path)
+    std::atomic<bool> engineGainKnown{false};
     std::atomic<float> engineDirX{0.f};
     std::atomic<float> engineDirY{0.f};
     std::atomic<float> engineDirZ{0.f};
@@ -166,6 +167,7 @@ public:
     // Samples the engine keeps painted ahead of its play cursor (snd_mixahead).
     uint32_t MixAheadSamples() const { return m_mixAhead.load(std::memory_order_acquire); }
     uint32_t DmaRate() const { return m_dmaRate; }
+    uint64_t SourceRevision() const { return m_sourceRevision.load(std::memory_order_acquire); }
 
     // ---- Game thread ----------------------------------------------------------------
     CaptureSlot& Slot(uint32_t index) { return *m_slots[index]; }
@@ -227,6 +229,7 @@ private:
     alignas(64) std::atomic<uint64_t> m_paintClock{0};
     alignas(64) std::atomic<uint64_t> m_frontier{0};
     alignas(64) std::atomic<uint64_t> m_soundClock{0};
+    std::atomic<uint64_t> m_sourceRevision{0};
     std::atomic<uint32_t> m_mixAhead{0};
     int32_t m_lastPaintedTime = 0;
     bool m_clockInitialized = false;

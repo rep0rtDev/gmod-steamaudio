@@ -138,14 +138,20 @@ private:
         IPLStaticMesh subMesh = nullptr;
         IPLInstancedMesh instance = nullptr;
         std::string name;
+        std::unique_ptr<MeshData> flattenedLocalMesh;
+        IPLMatrix4x4 transform{};
+        bool transformDirty = false;
     };
 
     bool CreateStaticMeshIn(IPLScene scene, const MeshData& mesh, IPLStaticMesh& out, const char* debugName);
+    bool RebuildFlattenedDynamic(DynamicEntry& entry);
+    void ReleaseRetiredMeshes();
 
     PhononContext* m_context = nullptr;
     IPLSceneSettings m_sceneSettings{};
     IPLScene m_scene = nullptr;
     std::vector<IPLStaticMesh> m_staticMeshes;
+    std::vector<IPLStaticMesh> m_retiredMeshes;
     size_t m_staticTriangles = 0;
     std::unordered_map<DynamicId, DynamicEntry> m_dynamic;
     DynamicId m_nextDynamic = 1;

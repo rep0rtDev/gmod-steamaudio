@@ -139,6 +139,72 @@ SA_TEST(ChannelCapture_StockImpactsAndExplosionsKeepEverySample)
     }
 }
 
+SA_TEST(ChannelCapture_FirstSpatializedGainSurvivesNewSlot)
+{
+    Harness h;
+    ChannelLayout layout;
+    layout.fvolume = 128;
+    layout.origin = 96;
+    h.capture.SetLayoutOverrides(layout);
+    std::vector<uint8_t> channel(512, 0);
+    const Vec3 position{200.f, 0.f, 32.f};
+    std::memcpy(channel.data() + 96, &position, sizeof(position));
+    const std::vector<int16_t> pcm(kIter, 4096);
+    h.Begin();
+    h.capture.OnSpatialize(reinterpret_cast<int32_t*>(channel.data() + 128), 128, {1.f, 0.f, 0.f}, 0.025f);
+    h.Mix16(channel.data(), pcm, kIter);
+    h.End();
+    SA_CHECK_NEAR(h.capture.Slot(0).engineGain.load(), 0.025f, 1e-6);
+    SA_CHECK_EQ(h.capture.Slot(0).engineMasterVol.load(), uint32_t(128));
+    const SourceParams params = h.sources[0]->GetParams();
+    SA_CHECK(params.engineGainValid);
+    SA_CHECK_NEAR(params.engineDirectGain, 0.025f, 1e-6);
+    SA_CHECK_EQ(h.capture.SourceRevision(), uint64_t(1));
+    h.Begin();
+    h.Mix16(channel.data(), pcm, kIter);
+    h.End();
+    SA_CHECK_EQ(h.capture.SourceRevision(), uint64_t(1));
+}
+
+SA_TEST(ChannelCapture_UsesNewestSpatializationRecord)
+{
+    Harness h;
+    std::vector<uint8_t> channel(512, 0);
+    const std::vector<int16_t> pcm(kIter, 4096);
+    h.Begin();
+    h.capture.OnSpatialize(reinterpret_cast<int32_t*>(channel.data() + 128), 128, {1.f, 0.f, 0.f}, 0.75f);
+    h.capture.OnSpatialize(reinterpret_cast<int32_t*>(channel.data() + 128), 128, {1.f, 0.f, 0.f}, 0.025f);
+    h.Mix16(channel.data(), pcm, kIter);
+    h.End();
+    SA_CHECK_NEAR(h.capture.Slot(0).engineGain.load(), 0.025f, 1e-6);
+}
+
+SA_TEST(ChannelCapture_SimulationSnapshotRejectsPreviousGeneration)
+{
+    SoundSource source(0, SourceKind::EngineChannel, 1, kDma, kDma, 8192);
+    SourceParams params;
+    params.positionValid = 1;
+    source.SetCapturedParams(params, 1, 101);
+    source.Sim().generation = 1;
+    IPLSource first = reinterpret_cast<IPLSource>(uintptr_t(1));
+    source.PublishSimulationSource(first);
+    source.MarkSimulationReady(IPL_SIMULATIONFLAGS_DIRECT);
+    SA_CHECK(source.LoadAudioSimulation().source == first);
+    SA_CHECK(source.SimulationReadyFlags() == IPL_SIMULATIONFLAGS_DIRECT);
+    source.SetCapturedParams(params, 2, 102);
+    SA_CHECK(source.AudioSimulationSource() == nullptr);
+    SA_CHECK_EQ(static_cast<int>(source.SimulationReadyFlags()), 0);
+    source.Sim().generation = 2;
+    IPLSource second = reinterpret_cast<IPLSource>(uintptr_t(2));
+    source.PublishSimulationSource(second);
+    SA_CHECK(source.AudioSimulationSource() == second);
+    SA_CHECK_EQ(static_cast<int>(source.SimulationReadyFlags()), 0);
+    source.MarkSimulationReady(IPL_SIMULATIONFLAGS_DIRECT);
+    SA_CHECK(source.LoadAudioSimulation().source == second);
+    SA_CHECK(source.SimulationReadyFlags() == IPL_SIMULATIONFLAGS_DIRECT);
+    source.PublishSimulationSource(nullptr);
+}
+
 SA_TEST(ChannelCapture_ConfiguredLayoutIsImmediatelyVisible)
 {
     ChannelCapture capture;

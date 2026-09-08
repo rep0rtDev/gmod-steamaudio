@@ -629,6 +629,8 @@ void EngineHooks::ApplyParamsForSlot(uint32_t slotIndex, ActiveSoundInfo* info, 
     }
     p.engineGainL = engineGain * PanFromDirection(relative, false) * 1.41421356f;
     p.engineGainR = engineGain * PanFromDirection(relative, true) * 1.41421356f;
+    p.engineDirectGain = engineGain;
+    p.engineGainValid = slot.engineGainKnown.load(std::memory_order_acquire) ? 1 : 0;
 
     // Per-sound overrides (Lua). Resolved up front because an override that
     // supplies a position (or forces spatialization) changes how the

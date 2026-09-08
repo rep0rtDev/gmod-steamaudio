@@ -84,8 +84,9 @@ void FallbackMixer::RenderSource(SoundSource& source, const float* const* input,
         const Vec3 rel = srcSA - origin;
         distMeters = rel.Length();
         distUnits = converter.LengthToSource(distMeters);
-        const float distanceGain =
-            SourceDistanceGain(params.distMult, distUnits, m_cfg.distanceGainMin, m_cfg.distanceGainMax);
+        const float distanceGain = params.engineGainValid && m_cfg.occlusion && params.occlusion
+                                       ? params.engineDirectGain
+                                       : SourceDistanceGain(params.distMult, distUnits, m_cfg.distanceGainMin, m_cfg.distanceGainMax);
 
         const Vec3 right{m_listener.frame.right.x, m_listener.frame.right.y, m_listener.frame.right.z};
         const Vec3 ahead{m_listener.frame.ahead.x, m_listener.frame.ahead.y, m_listener.frame.ahead.z};
@@ -162,7 +163,7 @@ void FallbackMixer::RenderSource(SoundSource& source, const float* const* input,
             m_left[i] += m_mono[i] * gl;
             m_right[i] += m_mono[i] * gr;
         }
-        if (m_roomSend.Enabled()) {
+        if (m_roomSend.Enabled() && (!m_cfg.physicalAcoustics || m_roomSend.always)) {
             const float mix = RoomMixForSource(*m_roomSend.preset, distUnits, DistMultToSoundLevel(params.distMult));
             // Approximate the attenuated direct level with the panned power sum.
             const float level = std::sqrt(fb.gainL * fb.gainL + fb.gainR * fb.gainR);

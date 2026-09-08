@@ -77,6 +77,7 @@ void ChannelCapture::Initialize(const std::vector<SoundSourcePtr>& sources, uint
         slot.generation.store(0, std::memory_order_relaxed);
         slot.lastClock.store(0, std::memory_order_relaxed);
         slot.everMixed.store(false, std::memory_order_relaxed);
+        slot.engineGainKnown.store(false, std::memory_order_relaxed);
         ResetSlotMeters(slot);
         slot.hashIndex = UINT32_MAX;
         slot.idleSince = 0;
@@ -94,6 +95,8 @@ void ChannelCapture::Initialize(const std::vector<SoundSourcePtr>& sources, uint
     m_clockInitialized = false;
     m_lastPaintedTime = 0;
     m_spatializeHead = 0;
+    m_spatialize.fill(SpatializeRecord{});
+    m_sourceRevision.store(0, std::memory_order_relaxed);
     m_layout = ChannelLayout{};
     m_layoutStable = false;
     m_inferenceRounds = 0;
@@ -241,7 +244,9 @@ void ChannelCapture::OnSpatialize(int32_t* volume, int32_t masterVol, const src:
         if (idx != UINT32_MAX) {
             CaptureSlot& slot = *m_slots[idx];
             slot.engineMasterVol.store(static_cast<uint32_t>(std::max(0, masterVol)), std::memory_order_relaxed);
-            slot.engineGain.store(gain, std::memory_order_relaxed);
+            const bool known = std::isfinite(gain) && gain >= 0.f;
+            slot.engineGain.store(known ? std::min(gain, 4.f) : 1.f, std::memory_order_relaxed);
+            slot.engineGainKnown.store(known, std::memory_order_release);
             slot.engineDirX.store(dir.x, std::memory_order_relaxed);
             slot.engineDirY.store(dir.y, std::memory_order_relaxed);
             slot.engineDirZ.store(dir.z, std::memory_order_relaxed);
@@ -361,6 +366,7 @@ void ChannelCapture::BeginNewSound(uint32_t idx, uintptr_t ch, uint64_t clock)
     slot.everMixed.store(false, std::memory_order_relaxed);
     ResetSlotMeters(slot);
     slot.engineGain.store(1.f, std::memory_order_relaxed);
+    slot.engineGainKnown.store(false, std::memory_order_relaxed);
     slot.engineMasterVol.store(255, std::memory_order_relaxed);
     slot.enginePtr.store(ch, std::memory_order_release);
     slot.generation.fetch_add(1, std::memory_order_acq_rel);
@@ -413,9 +419,11 @@ void ChannelCapture::CaptureMix(src::channel_t* chPtr, const void* pData, bool i
     if (guid != 0)
         slot.lastGuid = guid;
     if (slot.everMixed.load(std::memory_order_relaxed) && (clock > last + kReuseIdleSamples || changedGuid)) {
+        slot.everMixed.store(false, std::memory_order_release);
         slot.generation.fetch_add(1, std::memory_order_acq_rel);
         ResetSlotMeters(slot);
         slot.engineGain.store(1.f, std::memory_order_relaxed);
+        slot.engineGainKnown.store(false, std::memory_order_relaxed);
         slot.groupDiv = 1;
         slot.groupKnown = false;
         slot.holdL = slot.holdR = 0.f;
@@ -441,17 +449,22 @@ void ChannelCapture::CaptureMix(src::channel_t* chPtr, const void* pData, bool i
     // Attribute the most recent SpatializeChannel record whose volume pointer
     // lies inside this channel_t (window = 1 KiB) when the fvolume offset is
     // still unknown.
-    if (Layout().fvolume < 0) {
-        for (const SpatializeRecord& rec : m_spatialize) {
-            if (rec.volumePtr >= ch && rec.volumePtr < ch + 1024) {
-                slot.engineMasterVol.store(static_cast<uint32_t>(std::max(0, rec.masterVol)), std::memory_order_relaxed);
-                slot.engineGain.store(rec.gain, std::memory_order_relaxed);
-                slot.engineDirX.store(rec.dir.x, std::memory_order_relaxed);
-                slot.engineDirY.store(rec.dir.y, std::memory_order_relaxed);
-                slot.engineDirZ.store(rec.dir.z, std::memory_order_relaxed);
-                break;
-            }
-        }
+    const ChannelLayout layout = Layout();
+    const uint32_t recordCount = static_cast<uint32_t>(m_spatialize.size());
+    for (uint32_t age = 0; age < recordCount; ++age) {
+        const SpatializeRecord& rec = m_spatialize[(m_spatializeHead + recordCount - 1 - age) % recordCount];
+        const bool matches = layout.fvolume >= 0 ? rec.volumePtr == ch + static_cast<uintptr_t>(layout.fvolume)
+                                                : rec.volumePtr >= ch && rec.volumePtr - ch < 1024;
+        if (!matches)
+            continue;
+        const bool known = std::isfinite(rec.gain) && rec.gain >= 0.f;
+        slot.engineMasterVol.store(static_cast<uint32_t>(std::max(0, rec.masterVol)), std::memory_order_relaxed);
+        slot.engineGain.store(known ? std::min(rec.gain, 4.f) : 1.f, std::memory_order_relaxed);
+        slot.engineGainKnown.store(known, std::memory_order_release);
+        slot.engineDirX.store(rec.dir.x, std::memory_order_relaxed);
+        slot.engineDirY.store(rec.dir.y, std::memory_order_relaxed);
+        slot.engineDirZ.store(rec.dir.z, std::memory_order_relaxed);
+        break;
     }
 
     const size_t count = static_cast<size_t>(staged);
@@ -642,9 +655,15 @@ void ChannelCapture::FlushStages(int32_t iterationSamples)
         captured.positionValid = ReadOrigin(channel, captured.position) ? 1 : 0;
         captured.spatialize = captured.positionValid;
         captured.gain = static_cast<float>(std::min<uint32_t>(255, slot.engineMasterVol.load())) / 255.f;
-        ReadDistMult(channel, captured.distMult);
+        captured.engineGainValid = slot.engineGainKnown.load(std::memory_order_acquire) ? 1 : 0;
+        captured.engineDirectGain = slot.engineGain.load(std::memory_order_relaxed);
+        if (!ReadDistMult(channel, captured.distMult))
+            captured.distMult = SoundLevelToDistMult(static_cast<float>(src::kSndlvlNorm));
+        const bool firstBlock = !slot.everMixed.load(std::memory_order_relaxed);
         source.SetCapturedParams(captured, slot.generation.load(std::memory_order_acquire), slot.lastGuid);
         slot.everMixed.store(true, std::memory_order_release);
+        if (firstBlock)
+            m_sourceRevision.fetch_add(1, std::memory_order_release);
         source.TouchActivity(clock + produced);
         m_stats.samplesCaptured += produced;
         ResetStage(slot);

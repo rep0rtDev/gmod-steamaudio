@@ -247,24 +247,34 @@ bool SimulationThread::CancelBake()
 void SimulationThread::Run()
 {
     SetCurrentThreadName("sa-simulation");
+    auto nextTick = std::chrono::steady_clock::now();
+    uint64_t sourceRevision = 0;
     while (m_running.load(std::memory_order_acquire)) {
         const auto tickStart = std::chrono::steady_clock::now();
-        Tick();
-        const uint32_t elapsed = MicrosSince(tickStart);
-        uint32_t prevMax = m_stats.maxTickMicros.load(std::memory_order_relaxed);
-        while (elapsed > prevMax &&
-               !m_stats.maxTickMicros.compare_exchange_weak(prevMax, elapsed, std::memory_order_relaxed)) {
+        const uint64_t revision = m_setup.capture ? m_setup.capture->SourceRevision() : 0;
+        const bool urgent = revision != sourceRevision || m_pendingCommands.load(std::memory_order_acquire) != 0 ||
+                            m_cancelBakeRequested.load(std::memory_order_acquire);
+        if (tickStart >= nextTick || urgent) {
+            sourceRevision = revision;
+            Tick();
+            const uint32_t elapsed = MicrosSince(tickStart);
+            uint32_t prevMax = m_stats.maxTickMicros.load(std::memory_order_relaxed);
+            while (elapsed > prevMax &&
+                   !m_stats.maxTickMicros.compare_exchange_weak(prevMax, elapsed, std::memory_order_relaxed)) {
+            }
+            nextTick = tickStart + std::chrono::microseconds(
+                static_cast<int64_t>(std::max(5.f, m_cfg.simulationIntervalMs) * 1000.f));
         }
-
-        const float intervalMs = std::max(5.f, m_cfg.simulationIntervalMs);
-        const auto interval = std::chrono::microseconds(static_cast<int64_t>(intervalMs * 1000.f));
-        const auto sleepFor = interval > std::chrono::microseconds(elapsed) ? interval - std::chrono::microseconds(elapsed)
-                                                                             : std::chrono::microseconds(1000);
+        const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
+            nextTick - std::chrono::steady_clock::now());
+        const auto sleepFor = remaining.count() <= 0 ? std::chrono::microseconds(1000)
+                              : m_setup.capture ? std::min(remaining, std::chrono::microseconds(5000)) : remaining;
         std::unique_lock<std::mutex> lock(m_wakeMutex);
-        m_wake.wait_for(lock, sleepFor, [this] {
+        m_wake.wait_for(lock, sleepFor, [this, sourceRevision] {
             return !m_running.load(std::memory_order_acquire) ||
                    m_pendingCommands.load(std::memory_order_acquire) != 0 ||
-                   m_cancelBakeRequested.load(std::memory_order_acquire);
+                   m_cancelBakeRequested.load(std::memory_order_acquire) ||
+                   (m_setup.capture && m_setup.capture->SourceRevision() != sourceRevision);
         });
     }
 
@@ -294,6 +304,8 @@ void SimulationThread::Tick()
     ++m_tick;
     m_stats.ticks.fetch_add(1, std::memory_order_relaxed);
     m_cfg = m_runtime.Load();
+    const auto idleCutoff = std::chrono::steady_clock::now() - std::chrono::microseconds(
+        static_cast<int64_t>(kIdleTicksBeforeRetire * std::max(5.f, m_cfg.simulationIntervalMs) * 1000.f));
     DrainCommands();
     if (m_cancelBakeRequested.exchange(false, std::memory_order_acq_rel)) {
         m_bakeRequested = false;
@@ -312,7 +324,8 @@ void SimulationThread::Tick()
     }
 
     // 2. Geometry.
-    if (m_sceneDirty && m_setup.scene && m_setup.scene->IsValid()) {
+    const bool geometryChanged = m_sceneDirty && m_setup.scene && m_setup.scene->IsValid();
+    if (geometryChanged) {
         m_setup.scene->Commit();
         m_sceneDirty = false;
         m_stats.sceneCommits.fetch_add(1, std::memory_order_relaxed);
@@ -336,7 +349,7 @@ void SimulationThread::Tick()
             for (uint32_t i = 0; i < ChannelCapture::kSlots; ++i) {
                 CaptureSlot& slot = m_setup.capture->Slot(i);
                 if (slot.source && slot.enginePtr.load(std::memory_order_acquire) == 0 && slot.source->Sim().source &&
-                    m_tick - slot.source->Sim().lastActive > kIdleTicksBeforeRetire)
+                    slot.source->Sim().lastActiveTime < idleCutoff)
                     RetireSimulationSource(*slot.source);
             }
         }
@@ -354,8 +367,9 @@ void SimulationThread::Tick()
         static_cast<int64_t>(std::max(20.f, m_cfg.reflectionsIntervalMs) * 1000.f));
     const auto pathInterval = std::chrono::microseconds(
         static_cast<int64_t>(std::max(20.f, m_cfg.pathingIntervalMs) * 1000.f));
-    const bool runReflections = reflectionsCapable && (now - m_lastReflectionsTime) >= reflInterval;
-    const bool runPathing = pathingCapable && (now - m_lastPathingTime) >= pathInterval;
+    const bool refreshGeometry = m_cfg.physicalAcoustics && geometryChanged;
+    bool runReflections = reflectionsCapable && ((now - m_lastReflectionsTime) >= reflInterval || refreshGeometry);
+    bool runPathing = pathingCapable && ((now - m_lastPathingTime) >= pathInterval || refreshGeometry);
 
     // 4. Shared inputs.
     m_shared.listener = listener.frame;
@@ -384,10 +398,12 @@ void SimulationThread::Tick()
             const bool bound = slot.enginePtr.load(std::memory_order_acquire) != 0;
             const uint32_t generation = slot.generation.load(std::memory_order_acquire);
             if (!bound) {
-                if (source.Sim().source && m_tick - source.Sim().lastActive > kIdleTicksBeforeRetire)
+                if (source.Sim().source && source.Sim().lastActiveTime < idleCutoff)
                     RetireSimulationSource(source);
                 continue;
             }
+            if (!slot.everMixed.load(std::memory_order_acquire))
+                continue;
             const SourceParams params = source.GetParams();
             if (!params.spatialize || !params.positionValid) {
                 if (source.Sim().source)
@@ -398,6 +414,10 @@ void SimulationThread::Tick()
                 RetireSimulationSource(source);
             if (!EnsureSimulationSource(source, generation))
                 continue;
+            runReflections = runReflections || (reflectionsCapable && params.reflections &&
+                                               !(source.Sim().flags & IPL_SIMULATIONFLAGS_REFLECTIONS));
+            runPathing = runPathing || (pathingCapable && params.pathing &&
+                                       !(source.Sim().flags & IPL_SIMULATIONFLAGS_PATHING));
             if (UpdateSourceInputs(source, params, listener, runReflections, runPathing)) {
                 ++simulated;
                 simulatedSources.push_back(&source);
@@ -416,6 +436,10 @@ void SimulationThread::Tick()
         }
         if (!EnsureSimulationSource(source, 0))
             continue;
+        runReflections = runReflections || (reflectionsCapable && params.reflections &&
+                                           !(source.Sim().flags & IPL_SIMULATIONFLAGS_REFLECTIONS));
+        runPathing = runPathing || (pathingCapable && params.pathing &&
+                                   !(source.Sim().flags & IPL_SIMULATIONFLAGS_PATHING));
         if (UpdateSourceInputs(source, params, listener, runReflections, runPathing)) {
             ++simulated;
             simulatedSources.push_back(&source);
@@ -431,6 +455,12 @@ void SimulationThread::Tick()
         sim.RunDirect();
         m_stats.lastDirectMicros.store(MicrosSince(t0), std::memory_order_relaxed);
         m_stats.directRuns.fetch_add(1, std::memory_order_relaxed);
+    }
+    for (SoundSource* source : simulatedSources) {
+        auto& state = source->Sim();
+        state.flags = static_cast<IPLSimulationFlags>((state.flags | IPL_SIMULATIONFLAGS_DIRECT) & sim.Flags());
+        state.everSimulated = true;
+        source->MarkSimulationReady(state.flags);
     }
     if (runReflections) {
         const auto t0 = std::chrono::steady_clock::now();
@@ -729,6 +759,7 @@ bool SimulationThread::EnsureSimulationSource(SoundSource& source, uint32_t gene
     SoundSource::SimulationState& s = source.Sim();
     if (s.source) {
         s.lastActive = m_tick;
+        s.lastActiveTime = std::chrono::steady_clock::now();
         return true;
     }
     Simulator& sim = *m_setup.simulator;
@@ -742,6 +773,7 @@ bool SimulationThread::EnsureSimulationSource(SoundSource& source, uint32_t gene
         return false;
     s.generation = generation;
     s.lastActive = m_tick;
+    s.lastActiveTime = std::chrono::steady_clock::now();
     s.flags = static_cast<IPLSimulationFlags>(0);
     s.everSimulated = false;
     s.lastReflectionsRun = 0;

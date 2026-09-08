@@ -2,10 +2,10 @@
 
 **Development branch:** bounded-memory pathing is being integrated. GitHub Actions
 artifacts are development snapshots, not a claim that the full worker-based bake
-pipeline is ready for normal play. Local tests cover the paged cache primitives;
-the custom SDK build, route-equivalence tests, worker integration and full-map
-memory measurements still need to be completed. The workflow has not yet been
-verified by a successful GitHub Actions run.
+pipeline is ready for normal play. CI has built the custom SDK and modules and
+run route-equivalence tests. Local hardware tests cover GPU bake isolation and
+controlled acoustic scenes. Worker-process integration and full-map pathing
+memory/performance validation are still incomplete.
 
 Native Garry's Mod **client** binary module (`gmcl_steamaudio_win32.dll` /
 `gmcl_steamaudio_win64.dll`) that takes over the Source engine's client audio
@@ -268,6 +268,7 @@ Runtime:
 | convar | default | meaning |
 | --- | --- | --- |
 | `snd_sa_enabled` | 1 | master switch; 0 = engine mixes as usual (passthrough) |
+| `snd_sa_physical_acoustics` | 1 | preserve simulated material attenuation and source-dependent reflections; 0 restores the legacy acoustic policy |
 | `snd_sa_hrtf` | 1 | binaural rendering (0 = panning) |
 | `snd_sa_hrtf_interpolation` | 1 | 0 nearest, 1 bilinear |
 | `snd_sa_reflections` | 1 | ray-traced reflections / reverb |
@@ -289,16 +290,16 @@ Runtime:
 | `snd_sa_spatialize_stereo` | 1 | downmix + spatialize positional stereo sounds; UI/music still use their non-spatial policy |
 | `snd_sa_bass_spatial` | 1 | spatialize 3D `sound.PlayFile`/`PlayURL` channels |
 | `snd_sa_units_per_meter` | 52.4934 | Source units per meter |
-| `snd_sa_sim_interval_ms` | 100 | direct simulation period |
+| `snd_sa_sim_interval_ms` | 100 | periodic direct simulation interval; new captured sounds trigger earlier updates |
 | `snd_sa_reflections_interval_ms` / `snd_sa_pathing_interval_ms` | 250 | |
 | `snd_sa_source_radius` | 0.5 | volumetric occlusion radius (m) |
-| `snd_sa_occlusion_full` | 0.6 | visibility at/above which a source is unoccluded (volumetric partial visibility of emitters on/inside geometry is ignored) |
-| `snd_sa_occlusion_zero` | 0.1 | visibility at/below which a source is fully occluded |
-| `snd_sa_occlusion_min` | 0.3 | low-band gain a fully occluded source still leaks through walls (mid/high bands leak less); 0 = physical transmission only |
+| `snd_sa_occlusion_full` | 0.6 | legacy visibility remapping; ignored with physical acoustics enabled |
+| `snd_sa_occlusion_zero` | 0.1 | legacy visibility remapping; ignored with physical acoustics enabled |
+| `snd_sa_occlusion_min` | 0.3 | legacy wall-leak floor; ignored with physical acoustics enabled |
 | `snd_sa_emitter_hull_margin` | 4 | extra units an emitter is moved out of its own entity's collision bounds toward the listener |
 | `snd_sa_air_absorption` | 1.0 | |
 | `snd_sa_distance_gain_min` / `snd_sa_distance_gain_max` | 0.01 / 1.0 | |
-| `snd_sa_baked_reverb` | 1 | use baked probe data when available |
+| `snd_sa_baked_reverb` | 1 | physical mode uses listener-local baked reverb for listener-relative sounds; world emitters use position-dependent real-time reflections |
 | `snd_sa_bake_on_map_load` | 1 | bake probes in the background after map load |
 | `snd_sa_probe_spacing` / `snd_sa_probe_height` | 4.0 / 1.5 | probe grid (m) |
 | `snd_sa_bake_rays` / `snd_sa_bake_bounces` / `snd_sa_bake_duration` | 8192 / 16 / 1.5 | |
@@ -312,8 +313,8 @@ Runtime:
 | `snd_sa_static_prop_box_fallback` | 1 | hull-box approximation for props without a usable `.phy` |
 | `snd_sa_vmt_surfaceprops` | 1 | read `$surfaceprop` from `materials/*.vmt` for world faces (next map load) |
 | `snd_sa_surfaceprop_scripts` | 1 | load `scripts/surfaceproperties*.txt` so custom surfaceprops inherit acoustic materials (after `snd_sa_restart`) |
-| `snd_sa_pathing_vis_*`, `snd_sa_pathing_range`, `snd_sa_pathing_validation`, `snd_sa_pathing_alternate` | | pathing tuning |
-| `snd_sa_room_dsp` | 1 | `dsp_room` replacement: 0 off, 1 only for sources without Steam Audio reflections, 2 always |
+| `snd_sa_pathing_vis_*`, `snd_sa_pathing_range`, `snd_sa_pathing_validation`, `snd_sa_pathing_alternate` | | pathing tuning; physical mode always validates routes against current geometry |
+| `snd_sa_room_dsp` | 1 | `dsp_room` replacement: 0 off, 1 legacy fallback (disabled in physical mode), 2 explicitly add the preset to all sources |
 | `snd_sa_room_dsp_preset` | -1 | force a room preset (-1 follow `dsp_room`; 1–29 legacy, 100+ automatic templates) |
 | `snd_sa_room_dsp_gain` | 1.0 | room reverb wet gain |
 | `snd_sa_player_dsp` | 1 | `dsp_player` replacement (muffle/lowpass presets set by game code) |

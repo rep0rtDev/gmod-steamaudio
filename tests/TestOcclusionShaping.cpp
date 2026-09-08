@@ -27,9 +27,27 @@ IPLDirectEffectFlags OcclTrans()
 
 } // namespace
 
+SA_TEST(OcclusionShaping_DefaultPreservesSimulatedMaterials)
+{
+    RuntimeConfig cfg;
+    for (float visibility : {0.f, 0.05f, 0.35f, 0.65f, 1.f}) {
+        IPLDirectEffectParams params{};
+        params.occlusion = visibility;
+        params.transmission[0] = 0.01f;
+        params.transmission[1] = 0.005f;
+        params.transmission[2] = 0.001f;
+        ShapeOcclusion(params, OcclTrans(), cfg);
+        SA_CHECK_NEAR(params.occlusion, visibility, 1e-6);
+        SA_CHECK_NEAR(params.transmission[0], 0.01f, 1e-6);
+        SA_CHECK_NEAR(params.transmission[1], 0.005f, 1e-6);
+        SA_CHECK_NEAR(params.transmission[2], 0.001f, 1e-6);
+    }
+}
+
 SA_TEST(OcclusionShaping_KneeMapsVisibility)
 {
     RuntimeConfig cfg;
+    cfg.physicalAcoustics = false;
     cfg.occlusionFullVisibility = 0.6f;
     cfg.occlusionZeroVisibility = 0.1f;
     SA_CHECK_NEAR(ShapeOcclusionVisibility(1.0f, cfg), 1.f, 1e-6);
@@ -48,6 +66,7 @@ SA_TEST(OcclusionShaping_KneeMapsVisibility)
 SA_TEST(OcclusionShaping_FloorRaisesTransmissionOrOcclusion)
 {
     RuntimeConfig cfg;
+    cfg.physicalAcoustics = false;
     cfg.occlusionFullVisibility = 0.6f;
     cfg.occlusionZeroVisibility = 0.1f;
     cfg.occlusionMinGain = 0.3f;
@@ -164,6 +183,7 @@ SA_TEST(OcclusionShaping_DirectEffectKeepsLeakFloor)
     raw.transmission[2] = 0.001f;
 
     RuntimeConfig rt;
+    rt.physicalAcoustics = false;
     rt.occlusionMinGain = 0.3f;
     IPLDirectEffectParams shaped = raw;
     ShapeOcclusion(shaped, raw.flags, rt);

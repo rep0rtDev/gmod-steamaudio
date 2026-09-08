@@ -451,10 +451,12 @@ void SceneBuilder::Shutdown()
 {
     ClearDynamic();
     ClearStatic();
+    Commit();
     if (m_scene) {
         iplSceneRelease(&m_scene);
         m_scene = nullptr;
     }
+    ReleaseRetiredMeshes();
     m_context = nullptr;
     m_dirty = false;
 }
@@ -484,6 +486,38 @@ bool SceneBuilder::CreateStaticMeshIn(IPLScene scene, const MeshData& mesh, IPLS
     return true;
 }
 
+bool SceneBuilder::RebuildFlattenedDynamic(DynamicEntry& entry)
+{
+    MeshData transformed = *entry.flattenedLocalMesh;
+    const auto& m = entry.transform.elements;
+    for (auto& vertex : transformed.vertices) {
+        const IPLVector3 local = vertex;
+        vertex = {m[0][0] * local.x + m[0][1] * local.y + m[0][2] * local.z + m[0][3],
+                  m[1][0] * local.x + m[1][1] * local.y + m[1][2] * local.z + m[1][3],
+                  m[2][0] * local.x + m[2][1] * local.y + m[2][2] * local.z + m[2][3]};
+        if (!Vec3::FromIPL(vertex).IsFinite())
+            return false;
+    }
+    IPLStaticMesh replacement = nullptr;
+    if (!CreateStaticMeshIn(m_scene, transformed, replacement, entry.name.c_str()))
+        return false;
+    if (entry.subMesh) {
+        iplStaticMeshRemove(entry.subMesh, m_scene);
+        m_retiredMeshes.push_back(entry.subMesh);
+    }
+    entry.subMesh = replacement;
+    iplStaticMeshAdd(entry.subMesh, m_scene);
+    entry.transformDirty = false;
+    return true;
+}
+
+void SceneBuilder::ReleaseRetiredMeshes()
+{
+    for (IPLStaticMesh& mesh : m_retiredMeshes)
+        iplStaticMeshRelease(&mesh);
+    m_retiredMeshes.clear();
+}
+
 bool SceneBuilder::AddStaticMesh(const MeshData& mesh, const char* debugName)
 {
     if (!m_scene)
@@ -503,9 +537,13 @@ bool SceneBuilder::AddStaticMesh(const MeshData& mesh, const char* debugName)
 void SceneBuilder::ClearStatic()
 {
     for (IPLStaticMesh& mesh : m_staticMeshes) {
-        if (m_scene)
+        if (m_scene) {
             iplStaticMeshRemove(mesh, m_scene);
-        iplStaticMeshRelease(&mesh);
+            m_retiredMeshes.push_back(mesh);
+            mesh = nullptr;
+        } else {
+            iplStaticMeshRelease(&mesh);
+        }
     }
     if (!m_staticMeshes.empty())
         m_dirty = true;
@@ -521,6 +559,17 @@ SceneBuilder::DynamicId SceneBuilder::AddDynamic(const MeshData& localMesh, cons
 
     DynamicEntry entry;
     entry.name = debugName ? debugName : "";
+    if (m_sceneSettings.type == IPL_SCENETYPE_RADEONRAYS) {
+        entry.flattenedLocalMesh = std::make_unique<MeshData>(localMesh);
+        entry.transform = transform;
+        if (!RebuildFlattenedDynamic(entry))
+            return kInvalidDynamic;
+        const DynamicId id = m_nextDynamic++;
+        if (m_nextDynamic == kInvalidDynamic) ++m_nextDynamic;
+        m_dynamic.emplace(id, std::move(entry));
+        m_dirty = true;
+        return id;
+    }
 
     IPLerror err = iplSceneCreate(m_context->Handle(), &m_sceneSettings, &entry.subScene);
     if (err != IPL_STATUS_SUCCESS || !entry.subScene) {
@@ -560,7 +609,12 @@ void SceneBuilder::UpdateDynamic(DynamicId id, const IPLMatrix4x4& transform)
     auto it = m_dynamic.find(id);
     if (it == m_dynamic.end() || !m_scene)
         return;
-    iplInstancedMeshUpdateTransform(it->second.instance, m_scene, transform);
+    if (it->second.flattenedLocalMesh) {
+        it->second.transform = transform;
+        it->second.transformDirty = true;
+    } else {
+        iplInstancedMeshUpdateTransform(it->second.instance, m_scene, transform);
+    }
     m_dirty = true;
 }
 
@@ -575,9 +629,15 @@ void SceneBuilder::RemoveDynamic(DynamicId id)
     if (e.instance)
         iplInstancedMeshRelease(&e.instance);
     if (e.subMesh) {
-        if (e.subScene)
-            iplStaticMeshRemove(e.subMesh, e.subScene);
-        iplStaticMeshRelease(&e.subMesh);
+        if (e.flattenedLocalMesh && m_scene) {
+            iplStaticMeshRemove(e.subMesh, m_scene);
+            m_retiredMeshes.push_back(e.subMesh);
+            e.subMesh = nullptr;
+        } else {
+            if (e.subScene)
+                iplStaticMeshRemove(e.subMesh, e.subScene);
+            iplStaticMeshRelease(&e.subMesh);
+        }
     }
     if (e.subScene)
         iplSceneRelease(&e.subScene);
@@ -599,7 +659,15 @@ void SceneBuilder::Commit()
 {
     if (!m_scene || !m_dirty)
         return;
+    for (auto& item : m_dynamic) {
+        auto& entry = item.second;
+        if (entry.flattenedLocalMesh && entry.transformDirty && !RebuildFlattenedDynamic(entry)) {
+            SA_LOGW("Could not update flattened dynamic mesh '%s'; retaining previous geometry", entry.name.c_str());
+            entry.transformDirty = false;
+        }
+    }
     iplSceneCommit(m_scene);
+    ReleaseRetiredMeshes();
     m_dirty = false;
 }
 

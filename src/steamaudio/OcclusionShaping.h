@@ -29,6 +29,8 @@ constexpr float kOcclusionLeakBandWeights[3] = {1.f, 0.6f, 0.35f};
 
 inline float ShapeOcclusionVisibility(float raw, const RuntimeConfig& cfg)
 {
+    if (cfg.physicalAcoustics)
+        return std::clamp(raw, 0.f, 1.f);
     const float zero = std::clamp(cfg.occlusionZeroVisibility, 0.f, 0.95f);
     const float full = std::clamp(cfg.occlusionFullVisibility, zero + 0.05f, 1.f);
     const float v = std::clamp(raw, 0.f, 1.f);
@@ -43,7 +45,7 @@ inline float ShapeOcclusionVisibility(float raw, const RuntimeConfig& cfg)
 // the direct-effect apply flags that will be used with `params`.
 inline void ShapeOcclusion(IPLDirectEffectParams& params, IPLDirectEffectFlags flags, const RuntimeConfig& cfg)
 {
-    if (!(flags & IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION))
+    if (!(flags & IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION) || cfg.physicalAcoustics)
         return;
     const float visibility = ShapeOcclusionVisibility(params.occlusion, cfg);
     const float floor = std::clamp(cfg.occlusionMinGain, 0.f, 1.f);

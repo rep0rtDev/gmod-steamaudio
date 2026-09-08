@@ -78,6 +78,8 @@ public:
         // --- runtime -----------------------------------------------------
         RtBool("snd_sa_enabled", rt.enabled, &RuntimeConfig::enabled,
                "Route audio through Steam Audio (0 = engine mixer passthrough).");
+        RtBool("snd_sa_physical_acoustics", rt.physicalAcoustics, &RuntimeConfig::physicalAcoustics,
+               "Preserve simulated wall attenuation and source-dependent reflections (0 = legacy acoustic model).");
         RtBool("snd_sa_hrtf", rt.hrtf, &RuntimeConfig::hrtf, "Binaural HRTF rendering (0 = panning).");
         RtInt("snd_sa_hrtf_interpolation", rt.hrtfInterpolation, &RuntimeConfig::hrtfInterpolation,
               "HRTF interpolation: 0 nearest, 1 bilinear.", 0, 1);
@@ -126,11 +128,11 @@ public:
         RtFloat("snd_sa_source_radius", rt.sourceRadius, &RuntimeConfig::sourceRadius,
                 "Source radius (m) for volumetric occlusion.", 0.01f, 10.f);
         RtFloat("snd_sa_occlusion_full", rt.occlusionFullVisibility, &RuntimeConfig::occlusionFullVisibility,
-                "Visibility fraction at/above which a source counts as unoccluded.", 0.05f, 1.f);
+                "Legacy acoustic mode: visibility fraction at/above which a source counts as unoccluded.", 0.05f, 1.f);
         RtFloat("snd_sa_occlusion_zero", rt.occlusionZeroVisibility, &RuntimeConfig::occlusionZeroVisibility,
-                "Visibility fraction at/below which a source counts as fully occluded.", 0.f, 0.95f);
+                "Legacy acoustic mode: visibility fraction at/below which a source counts as fully occluded.", 0.f, 0.95f);
         RtFloat("snd_sa_occlusion_min", rt.occlusionMinGain, &RuntimeConfig::occlusionMinGain,
-                "Low-band gain that leaks through walls for a fully occluded source (0 = physical transmission only).",
+                "Legacy acoustic mode wall-leak floor; ignored when physical acoustics is enabled.",
                 0.f, 1.f);
         RtFloat("snd_sa_emitter_hull_margin", rt.emitterHullMarginUnits, &RuntimeConfig::emitterHullMarginUnits,
                 "Extra distance (units) an emitter is moved out of its own entity's bounds toward the listener.",
@@ -142,7 +144,7 @@ public:
         RtFloat("snd_sa_distance_gain_max", rt.distanceGainMax, &RuntimeConfig::distanceGainMax,
                 "Distance attenuation ceiling.", 0.f, 4.f);
         RtBool("snd_sa_baked_reverb", rt.useBakedReverb, &RuntimeConfig::useBakedReverb,
-               "Use baked reverb probes when available.");
+               "Use baked reverb probes; physical mode limits listener-local reverb to listener-relative sounds.");
         RtBool("snd_sa_bake_on_map_load", rt.bakeOnMapLoad, &RuntimeConfig::bakeOnMapLoad,
                "Bake reverb probes in the background after map load.");
         RtFloat("snd_sa_probe_spacing", rt.probeSpacing, &RuntimeConfig::probeSpacing, "Probe spacing (m).", 0.5f,

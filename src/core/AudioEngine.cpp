@@ -212,6 +212,7 @@ void ParseRuntimeConfig(const JsonValue& v, RuntimeConfig& out)
     ReadNumber(v, "occlusion_full_visibility", out.occlusionFullVisibility);
     ReadNumber(v, "occlusion_zero_visibility", out.occlusionZeroVisibility);
     ReadNumber(v, "occlusion_min_gain", out.occlusionMinGain);
+    ReadBool(v, "physical_acoustics", out.physicalAcoustics);
     ReadNumber(v, "emitter_hull_margin_units", out.emitterHullMarginUnits);
     ReadNumber(v, "air_absorption_scale", out.airAbsorptionScale);
     ReadNumber(v, "distance_gain_min", out.distanceGainMin);

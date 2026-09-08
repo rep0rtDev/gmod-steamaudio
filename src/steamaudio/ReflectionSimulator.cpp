@@ -102,12 +102,11 @@ void ReflectionSimulator::FillSharedInputs(const RuntimeConfig& cfg, IPLSimulati
 void ReflectionSimulator::FillSourceInputs(const RuntimeConfig& cfg, const SourceParams& params,
                                            IPLSimulationInputs& inputs) const
 {
-    (void)params;
     for (int b = 0; b < IPL_NUM_BANDS; ++b)
         inputs.reverbScale[b] = 1.f;
     inputs.hybridReverbTransitionTime = std::max(0.05f, cfg.hybridTransitionTime);
     inputs.hybridReverbOverlapPercent = std::max(0.f, std::min(cfg.hybridOverlapPercent, 1.f));
-    if (cfg.useBakedReverb && HasBakedData()) {
+    if (cfg.useBakedReverb && HasBakedData() && (!cfg.physicalAcoustics || params.listenerRelative)) {
         inputs.baked = IPL_TRUE;
         inputs.bakedDataIdentifier = m_reverbIdentifier;
     } else {

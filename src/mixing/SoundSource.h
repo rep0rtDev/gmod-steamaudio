@@ -20,6 +20,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -60,6 +61,7 @@ struct SourceParams {
     float gain = 1.f;             // linear, non-spatial: channel volume * master volume
     float engineGainL = 1.f;      // last spatialized per-speaker gains reported by the engine mixer
     float engineGainR = 1.f;
+    float engineDirectGain = 1.f;
     float distMult = 0.f;         // Source attenuation multiplier (0 = no distance attenuation)
     float radiusMeters = 0.f;     // volumetric occlusion radius
     float dipoleWeight = 0.f;     // directivity: 0 = omni, 1 = full dipole
@@ -77,6 +79,7 @@ struct SourceParams {
     uint8_t fromServer = 0;
     uint8_t positionValid = 0;    // 0 while the position is unknown (falls back to engine gains)
     uint8_t listenerRelative = 0;
+    uint8_t engineGainValid = 0;
 };
 
 // What the audio thread last did with a source (published for diagnostics,
@@ -187,6 +190,10 @@ public:
         const bool same = game.guid != 0 && captured.guid != 0 ? game.guid == captured.guid
                                                               : game.generation == captured.generation;
         SourceParams p = same ? game.params : captured.params;
+        if (captured.params.engineGainValid) {
+            p.engineDirectGain = captured.params.engineDirectGain;
+            p.engineGainValid = 1;
+        }
         if (!p.positionValid && captured.params.positionValid) {
             p.position = captured.params.position;
             p.positionValid = 1;
@@ -247,6 +254,7 @@ public:
         uint64_t lastReflectionsRun = 0;
         uint64_t lastPathingRun = 0;
         uint64_t lastActive = 0;      // sim tick when the source was last seen active
+        std::chrono::steady_clock::time_point lastActiveTime{};
         uint32_t generation = 0;      // engine slot generation the IPLSource belongs to
         Vec3 lastPosition{};
         bool everSimulated = false;
@@ -266,16 +274,31 @@ public:
     // simulation thread publishes a retained IPLSource handle for that purpose
     // and only releases it after the audio thread can no longer observe it
     // (see SimulationThread's deferred release list).
-    void PublishSimulationSource(IPLSource source) { m_audioSimSource.store(source, std::memory_order_release); }
-    IPLSource AudioSimulationSource() const { return m_audioSimSource.load(std::memory_order_acquire); }
+    struct AudioSimulation {
+        IPLSource source = nullptr;
+        IPLSimulationFlags flags = static_cast<IPLSimulationFlags>(0);
+        uint32_t generation = 0;
+    };
+    void PublishSimulationSource(IPLSource source)
+    {
+        m_audioSimulation.Store(AudioSimulation{source, static_cast<IPLSimulationFlags>(0), m_sim.generation});
+    }
+    AudioSimulation LoadAudioSimulation() const
+    {
+        const AudioSimulation result = m_audioSimulation.Load();
+        if (m_kind == SourceKind::EngineChannel && result.generation != m_captureParams.Load().generation)
+            return AudioSimulation{};
+        return result;
+    }
+    IPLSource AudioSimulationSource() const { return LoadAudioSimulation().source; }
     void MarkSimulationReady(IPLSimulationFlags flags)
     {
-        m_simReadyFlags.store(static_cast<uint32_t>(flags), std::memory_order_release);
+        AudioSimulation result = m_audioSimulation.Load();
+        result.flags = flags;
+        result.generation = m_sim.generation;
+        m_audioSimulation.Store(result);
     }
-    IPLSimulationFlags SimulationReadyFlags() const
-    {
-        return static_cast<IPLSimulationFlags>(m_simReadyFlags.load(std::memory_order_acquire));
-    }
+    IPLSimulationFlags SimulationReadyFlags() const { return LoadAudioSimulation().flags; }
 
     // ---- Audio-thread state -------------------------------------------------------
     struct RenderState {
@@ -334,6 +357,9 @@ private:
         p.gain = Clamp(p.gain, 0.f, 4.f);
         p.engineGainL = Clamp(p.engineGainL, 0.f, 8.f);
         p.engineGainR = Clamp(p.engineGainR, 0.f, 8.f);
+        if (!std::isfinite(p.engineDirectGain) || p.engineDirectGain < 0.f)
+            p.engineGainValid = 0;
+        p.engineDirectGain = p.engineGainValid ? Clamp(p.engineDirectGain, 0.f, 4.f) : 1.f;
         p.distMult = Clamp(p.distMult, 0.f, 1e6f);
         p.radiusMeters = Clamp(p.radiusMeters, 0.f, 10.f);
         p.dipoleWeight = Clamp(p.dipoleWeight, 0.f, 1.f);
@@ -352,8 +378,7 @@ private:
     SeqLock<ParamSnapshot> m_params;
     SeqLock<ParamSnapshot> m_captureParams;
     SeqLock<RenderDiag> m_renderDiag;
-    std::atomic<IPLSource> m_audioSimSource{nullptr};
-    std::atomic<uint32_t> m_simReadyFlags{0};
+    SeqLock<AudioSimulation> m_audioSimulation;
     std::atomic<bool> m_stopRequested{false};
     std::atomic<bool> m_renderFinished{false};
     std::atomic<bool> m_endOfStream{false};

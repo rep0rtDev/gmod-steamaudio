@@ -92,7 +92,7 @@ void PathingSimulator::FillSourceInputs(const RuntimeConfig& cfg, const SourcePa
     inputs.visThreshold = std::max(0.f, std::min(cfg.pathingVisThreshold, 1.f));
     inputs.visRange = std::max(1.f, cfg.pathingVisRange);
     inputs.pathingOrder = std::max(0, std::min(cfg.ambisonicOrder, m_static.maxAmbisonicOrder));
-    inputs.enableValidation = cfg.pathingValidation ? IPL_TRUE : IPL_FALSE;
+    inputs.enableValidation = cfg.physicalAcoustics || cfg.pathingValidation ? IPL_TRUE : IPL_FALSE;
     inputs.findAlternatePaths = cfg.pathingAlternatePaths ? IPL_TRUE : IPL_FALSE;
 }
 

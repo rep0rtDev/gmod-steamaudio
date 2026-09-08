@@ -27,6 +27,7 @@
   },
   "runtime": {
     "enabled": true,
+    "physical_acoustics": true,
     "hrtf": true,
     "hrtf_interpolation": 1,
     "reflections": true,

@@ -510,8 +510,9 @@ void HRTFRenderer::RenderSource(SoundSource& source, const float* const* input, 
 
     IPLSimulationOutputs outputs{};
     bool haveOutputs = false;
-    const IPLSource simSource = source.AudioSimulationSource();
-    const IPLSimulationFlags readyFlags = source.SimulationReadyFlags();
+    const auto simulation = source.LoadAudioSimulation();
+    const IPLSource simSource = simulation.source;
+    const IPLSimulationFlags readyFlags = simulation.flags;
     if (simSource && (readyFlags & IPL_SIMULATIONFLAGS_DIRECT)) {
         iplSourceGetOutputs(simSource, readyFlags, &outputs);
         haveOutputs = true;
@@ -573,6 +574,8 @@ void HRTFRenderer::RenderSource(SoundSource& source, const float* const* input, 
     }
     directParams.distanceAttenuation =
         SourceDistanceGain(params.distMult, distUnits, m_cfg.distanceGainMin, m_cfg.distanceGainMax);
+    if (!haveOutputs && params.engineGainValid && m_cfg.occlusion && params.occlusion)
+        directParams.distanceAttenuation = params.engineDirectGain;
     if (params.listenerRelative) {
         directParams.flags = static_cast<IPLDirectEffectFlags>(0);
         directParams.distanceAttenuation = 1.f;
@@ -615,7 +618,7 @@ void HRTFRenderer::RenderSource(SoundSource& source, const float* const* input, 
     // less, while the mix ratio itself grows with distance like the engine's.
     const bool renderReflections = haveOutputs && m_cfg.reflections && params.reflections && fx.reflection &&
                                    (readyFlags & IPL_SIMULATIONFLAGS_REFLECTIONS);
-    if (m_roomSend.Enabled() && (m_roomSend.always || !renderReflections)) {
+    if (m_roomSend.Enabled() && (m_roomSend.always || (!m_cfg.physicalAcoustics && !renderReflections))) {
         const float mix = RoomMixForSource(*m_roomSend.preset, distUnits, DistMultToSoundLevel(params.distMult));
         if (mix > 0.f) {
             dsp::MixInto(m_roomSend.bus, m_monoDirect.Channel(0), static_cast<size_t>(m_frameSize),
@@ -664,6 +667,13 @@ void HRTFRenderer::RenderSource(SoundSource& source, const float* const* input, 
         pathParams.binaural = useHrtf ? IPL_TRUE : IPL_FALSE;
         pathParams.hrtf = m_hrtf;
         pathParams.listener = m_listenerFrame;
+        if (m_cfg.physicalAcoustics) {
+            const float visibility = m_cfg.occlusion && params.occlusion ? Clamp(outputs.direct.occlusion, 0.f, 1.f) : 1.f;
+            for (int32_t i = 0; i < AmbisonicChannels(pathParams.order); ++i)
+                m_pathShScratch[static_cast<size_t>(i)] = outputs.pathing.shCoeffs[i] * (1.f - visibility);
+            pathParams.shCoeffs = m_pathShScratch.data();
+            pathParams.normalizeEQ = IPL_FALSE;
+        }
         iplPathEffectApply(fx.path, &pathParams, m_monoIn.Get(), m_stereoScratch.Get());
         AddToMaster(*m_stereoScratch.Get(), gain * m_cfg.pathingGain, m_frameDirectEnergy);
         ++rs.framesPathing;

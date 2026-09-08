@@ -165,12 +165,20 @@ jobs:
             "SA_REQUIRE_PAGED_PATHING=1" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
             $runtime = @("-DSA_BUNDLE_RUNTIME_DIR=$($dll.DirectoryName)")
           }
-          cmake -S . -B build -G "Visual Studio 17 2022" -A ${{ matrix.cmake_arch }} -DSA_WARNINGS_AS_ERRORS=ON @runtime
+          cmake -S . -B build -G "Visual Studio 17 2022" -A ${{ matrix.cmake_arch }} -DSA_BUILD_TESTS=ON -DSA_WARNINGS_AS_ERRORS=ON @runtime
           if ($LASTEXITCODE -ne 0) { throw "Module configure failed" }
       - name: Build
         run: cmake --build build --config Release --parallel 2
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
+      - name: Preserve test logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: msvc-${{ matrix.arch }}-test-logs
+          path: build/Testing/Temporary/*.log
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Verify exports
         shell: pwsh
         run: |
@@ -179,7 +187,12 @@ jobs:
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
           $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
           $exports = & $dumpbin.FullName /EXPORTS $dll
+          if ($LASTEXITCODE -ne 0) { throw "Cannot inspect module exports" }
           if (-not ($exports -match "gmod13_open") -or -not ($exports -match "gmod13_close")) { throw "GMod entry points missing" }
+          $pdb = "build/Release/${{ matrix.module }}.pdb"
+          if (-not (Test-Path $pdb)) { throw "Module PDB missing" }
+          $headers = & $dumpbin.FullName /HEADERS $dll
+          if ($LASTEXITCODE -ne 0 -or -not ($headers -match "Format: RSDS")) { throw "Module has no PDB signature" }
       - name: Package development build
         if: matrix.arch == 'x64'
         shell: pwsh
@@ -193,6 +206,8 @@ jobs:
           path: |
             build/Release/${{ matrix.module }}.dll
             build/Release/${{ matrix.module }}.pdb
+            build/tests/Release/sa_tests.exe
+            build/tests/Release/sa_tests.pdb
             gmod-steamaudio-win64-development.zip
           if-no-files-found: error
           retention-days: 14
@@ -253,7 +268,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake ninja-build g++
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DSA_WARNINGS_AS_ERRORS=ON
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DSA_BUILD_TESTS=ON -DSA_WARNINGS_AS_ERRORS=ON
       - name: Build
         run: cmake --build build --parallel 2
       - name: Fetch reference Steam Audio runtime
@@ -263,3 +278,11 @@ jobs:
           echo "SA_PHONON_DIR=$PWD/sdk/steamaudio/lib/linux-x64" >> "$GITHUB_ENV"
       - name: Test
         run: ctest --test-dir build --output-on-failure
+      - name: Preserve test logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linux-test-logs
+          path: build/Testing/Temporary/*.log
+          if-no-files-found: ignore
+          retention-days: 14

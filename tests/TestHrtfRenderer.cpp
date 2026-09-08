@@ -11,6 +11,7 @@
 #include "steamaudio/ReflectionSimulator.h"
 #include "steamaudio/CPUFallbackBackend.h"
 #include "steamaudio/PathingSimulator.h"
+#include "steamaudio/PhyModel.h"
 #include "steamaudio/GPUBackend.h"
 #include "platform/PlatformAudioOutput.h"
 #include "util/Logging.h"
@@ -20,6 +21,7 @@
 #include <thread>
 #include <type_traits>
 #include "mixing/SoundSource.h"
+#include "mixing/SimulationThread.h"
 #include "steamaudio/Config.h"
 #include "steamaudio/HRTFRenderer.h"
 #include "steamaudio/PhononContext.h"
@@ -29,6 +31,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -115,6 +118,95 @@ float IPLCALL TestDistanceCallback(IPLfloat32 distanceMeters, void* userData)
     const float* distMult = static_cast<const float*>(userData);
     return SourceDistanceGain(*distMult, distanceMeters * 52.49f);
 }
+
+void AddAcousticBox(MeshData& mesh, const Vec3& lo, const Vec3& hi, const IPLMaterial& material)
+{
+    std::vector<Vec3> vertices;
+    std::vector<PhyTriangle> triangles;
+    AppendBox(lo, hi, vertices, triangles);
+    const int32_t index = mesh.AddMaterial(material);
+    for (const auto& triangle : triangles)
+        mesh.AddTriangle(vertices[triangle.indices[0]].ToIPL(), vertices[triangle.indices[1]].ToIPL(),
+                         vertices[triangle.indices[2]].ToIPL(), index);
+}
+
+struct TwoRoomScene {
+    MeshData walls, door;
+    TwoRoomScene()
+    {
+        IPLMaterial material{};
+        for (float& band : material.absorption) band = 0.2f;
+        material.transmission[0] = 0.05f;
+        material.transmission[1] = 0.02f;
+        material.transmission[2] = 0.01f;
+        material.scattering = 0.5f;
+        AddAcousticBox(walls, {-6.f, -0.25f, -4.f}, {6.f, 0.f, 4.f}, material);
+        AddAcousticBox(walls, {-6.f, 3.f, -4.f}, {6.f, 3.25f, 4.f}, material);
+        AddAcousticBox(walls, {-6.25f, 0.f, -4.f}, {-6.f, 3.f, 4.f}, material);
+        AddAcousticBox(walls, {6.f, 0.f, -4.f}, {6.25f, 3.f, 4.f}, material);
+        AddAcousticBox(walls, {-6.f, 0.f, -4.25f}, {6.f, 3.f, -4.f}, material);
+        AddAcousticBox(walls, {-6.f, 0.f, 4.f}, {6.f, 3.f, 4.25f}, material);
+        AddAcousticBox(walls, {-0.15f, 0.f, -4.f}, {0.15f, 3.f, -0.75f}, material);
+        AddAcousticBox(walls, {-0.15f, 0.f, 0.75f}, {0.15f, 3.f, 4.f}, material);
+        AddAcousticBox(walls, {-0.15f, 2.4f, -0.75f}, {0.15f, 3.f, 0.75f}, material);
+        AddAcousticBox(door, {-0.15f, 0.f, -0.75f}, {0.15f, 2.4f, 0.75f}, material);
+    }
+};
+
+struct SimulationOutputOverride {
+    using Function = std::decay_t<decltype(iplSourceGetOutputs)>;
+    Function original = iplSourceGetOutputs;
+    IPLSource target;
+    IPLSimulationOutputs outputs{};
+    inline static SimulationOutputOverride* active = nullptr;
+    explicit SimulationOutputOverride(IPLSource source) : target(source)
+    {
+        active = this;
+        const_cast<Function&>(iplSourceGetOutputs) = &Dispatch;
+    }
+    ~SimulationOutputOverride()
+    {
+        const_cast<Function&>(iplSourceGetOutputs) = original;
+        active = nullptr;
+    }
+    static void IPLCALL Dispatch(IPLSource source, IPLSimulationFlags flags, IPLSimulationOutputs* output)
+    {
+        if (source == active->target) *output = active->outputs;
+        else active->original(source, flags, output);
+    }
+};
+
+struct BlockedReflectionRun {
+    using Function = std::decay_t<decltype(iplSimulatorRunReflections)>;
+    Function original = iplSimulatorRunReflections;
+    SimulationThread& worker;
+    SoundSource& source;
+    std::atomic<bool> entered{false}, released{false};
+    inline static BlockedReflectionRun* active = nullptr;
+
+    BlockedReflectionRun(SimulationThread& thread, SoundSource& sound) : worker(thread), source(sound)
+    {
+        active = this;
+        const_cast<Function&>(iplSimulatorRunReflections) = &Dispatch;
+    }
+    ~BlockedReflectionRun()
+    {
+        released.store(true, std::memory_order_release);
+        worker.Stop();
+        const_cast<Function&>(iplSimulatorRunReflections) = original;
+        active = nullptr;
+    }
+    static void IPLCALL Dispatch(IPLSimulator simulator)
+    {
+        auto& self = *active;
+        if (self.source.AudioSimulationSource()) {
+            self.entered.store(true, std::memory_order_release);
+            while (!self.released.load(std::memory_order_acquire))
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        self.original(simulator);
+    }
+};
 
 struct BakeDeviceObserver {
     using Function = std::decay_t<decltype(iplReflectionsBakerBake)>;
@@ -278,6 +370,465 @@ SA_TEST(ReflectionBake_GpuDeviceIsolatedFromLiveSceneUpdates)
     live.Commit();
     std::printf("    isolated GPU bake: %d live BVH updates, %d/%d probes, cancellation=%d\n",
                 updates, status.completedProbes, status.probes, cancelRequested ? 1 : 0);
+}
+
+SA_TEST(Pathing_PhysicalModeValidatesRoutes)
+{
+    PathingSimulator pathing;
+    RuntimeConfig runtime;
+    SourceParams source;
+    IPLSimulationInputs inputs{};
+    pathing.FillSourceInputs(runtime, source, nullptr, inputs);
+    SA_CHECK(inputs.enableValidation == IPL_TRUE);
+    runtime.physicalAcoustics = false;
+    pathing.FillSourceInputs(runtime, source, nullptr, inputs);
+    SA_CHECK(inputs.enableValidation == IPL_FALSE);
+    runtime.pathingValidation = true;
+    pathing.FillSourceInputs(runtime, source, nullptr, inputs);
+    SA_CHECK(inputs.enableValidation == IPL_TRUE);
+}
+
+SA_TEST(SimulationThread_PrimesNewCaptureWithoutWaitingForPeriodicTick)
+{
+    const char* dir = PhononDir();
+    if (!dir) throw satest::Skipped{"SA_PHONON_DIR not set"};
+    StaticConfig fixed;
+    fixed.maxSources = 2;
+    fixed.maxIrDuration = 0.25f;
+    fixed.simulationThreads = 1;
+    PhononContext context;
+    std::string error;
+    SA_CHECK(context.Initialize(fixed, {dir}, error));
+    Simulator simulator;
+    SA_CHECK(simulator.Initialize(context, {}, fixed, error));
+    auto source = std::make_shared<SoundSource>(47, SourceKind::EngineChannel, 1, 44100, 44100, 8192);
+    ChannelCapture capture;
+    capture.Initialize({source}, 44100);
+    ChannelLayout layout;
+    layout.origin = 96;
+    capture.SetLayoutOverrides(layout);
+    std::vector<uint8_t> channel(512, 0);
+    const Vec3 position{200.f, 0.f, 32.f};
+    std::memcpy(channel.data() + 96, &position, sizeof(position));
+    SimulationThread worker;
+    RuntimeConfig runtime;
+    runtime.simulationIntervalMs = 5000.f;
+    runtime.reflections = runtime.pathing = false;
+    worker.SetRuntimeConfig(runtime);
+    ListenerState listener;
+    listener.valid = true;
+    listener.frame = CoordinateConverter{}.FrameToSA({}, {1.f, 0.f, 0.f}, {0.f, 0.f, 1.f});
+    worker.SetExternalListener(listener);
+    SimulationThreadSetup setup;
+    setup.context = &context;
+    setup.simulator = &simulator;
+    setup.capture = &capture;
+    SA_CHECK(worker.Start(setup));
+    const auto initialDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (worker.Stats().directRuns.load() == 0 && std::chrono::steady_clock::now() < initialDeadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const uint64_t before = worker.Stats().directRuns.load();
+    SA_CHECK(before > 0);
+    std::vector<int16_t> pcm(512, 4096);
+    capture.OnPaintBegin(0, 0, 512);
+    capture.OnMixBegin(512);
+    capture.CaptureMix(reinterpret_cast<src::channel_t*>(channel.data()), pcm.data(), true, false, 0, 0,
+                       static_cast<int32_t>(src::kFixScale), 512);
+    capture.OnTransferSamples(512);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (!(source->SimulationReadyFlags() & IPL_SIMULATIONFLAGS_DIRECT) && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const bool ready = (source->SimulationReadyFlags() & IPL_SIMULATIONFLAGS_DIRECT) != 0;
+    const uint64_t runs = worker.Stats().directRuns.load();
+    worker.Stop();
+    SA_CHECK(ready);
+    SA_CHECK_EQ(runs, before + 1);
+}
+
+SA_TEST(SimulationThread_PublishesDirectBeforeSlowReflections)
+{
+    const char* dir = PhononDir();
+    if (!dir) throw satest::Skipped{"SA_PHONON_DIR not set"};
+    StaticConfig fixed;
+    fixed.maxSources = 2;
+    fixed.maxIrDuration = 0.25f;
+    fixed.simulationThreads = 1;
+    PhononContext context;
+    std::string error;
+    SA_CHECK(context.Initialize(fixed, {dir}, error));
+    SceneBuilder scene;
+    SA_CHECK(scene.Initialize(context, {}));
+    scene.Commit();
+    Simulator simulator;
+    SA_CHECK(simulator.Initialize(context, {}, fixed, error));
+    ReflectionSimulator reflections;
+    SA_CHECK(reflections.Initialize(context, simulator, fixed));
+    auto source = std::make_shared<SoundSource>(42, SourceKind::Procedural, 1, 44100, 44100, 8192);
+    SourceParams params;
+    params.position = {200.f, 0.f, 32.f};
+    params.positionValid = 1;
+    source->SetParams(params);
+    SimulationThread worker;
+    BlockedReflectionRun block(worker, *source);
+    RuntimeConfig runtime;
+    runtime.numRays = 64;
+    runtime.numBounces = 1;
+    runtime.irDuration = 0.2f;
+    runtime.hybridTransitionTime = 0.05f;
+    worker.SetRuntimeConfig(runtime);
+    ListenerState listener;
+    listener.valid = true;
+    listener.frame = CoordinateConverter{}.FrameToSA({}, {1.f, 0.f, 0.f}, {0.f, 0.f, 1.f});
+    worker.SetExternalListener(listener);
+    SimulationThreadSetup setup;
+    setup.context = &context;
+    setup.simulator = &simulator;
+    setup.reflections = &reflections;
+    setup.scene = &scene;
+    SA_CHECK(worker.Start(setup));
+    SA_CHECK(worker.AddStreamSource(source));
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!block.entered.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const bool entered = block.entered.load(std::memory_order_acquire);
+    const IPLSimulationFlags ready = source->SimulationReadyFlags();
+    block.released.store(true, std::memory_order_release);
+    worker.Stop();
+    SA_CHECK(entered);
+    SA_CHECK((ready & IPL_SIMULATIONFLAGS_DIRECT) != 0);
+    SA_CHECK((ready & IPL_SIMULATIONFLAGS_REFLECTIONS) == 0);
+}
+
+SA_TEST(HrtfRenderer_DoesNotInventRoomReverbBeforeSimulation)
+{
+    const char* dir = PhononDir();
+    if (!dir) throw satest::Skipped{"SA_PHONON_DIR not set"};
+    StaticConfig fixed;
+    fixed.maxSources = 2;
+    PhononContext context;
+    std::string error;
+    SA_CHECK(context.Initialize(fixed, {dir}, error));
+    HRTFRenderer renderer;
+    SA_CHECK(renderer.Initialize(context, {}, fixed, error));
+    SoundSource source(43, SourceKind::EngineChannel, 1, 44100, 44100, 8192);
+    SourceParams params;
+    params.position = {200.f, 0.f, 32.f};
+    params.positionValid = 1;
+    source.SetParams(params);
+    const auto& preset = FindRoomPreset(7);
+    SA_CHECK(preset.Active());
+    SA_CHECK(RoomMixForSource(preset, 200.f, 0.f) > 0.f);
+    std::vector<float> input(fixed.frameSize, 0.25f), room(fixed.frameSize, 0.f);
+    const float* channels[] = {input.data()};
+    ListenerState listener;
+    listener.valid = true;
+    listener.frame = CoordinateConverter{}.FrameToSA({0.f, 0.f, 32.f}, {1.f, 0.f, 0.f}, {0.f, 0.f, 1.f});
+    renderer.BeginFrame({}, listener, {room.data(), &preset, false});
+    renderer.RenderSource(source, channels, 1, 1.f);
+    renderer.EndFrame();
+    const bool sent = source.Render().roomSent;
+    renderer.ReleaseEffects(source.Render().effects);
+    source.Render().effects = nullptr;
+    SA_CHECK(!sent);
+    for (float sample : room) SA_CHECK_NEAR(sample, 0.f, 1e-7);
+}
+
+SA_TEST(HrtfRenderer_FirstImpulseUsesCapturedEngineAttenuation)
+{
+    const char* dir = PhononDir();
+    if (!dir) throw satest::Skipped{"SA_PHONON_DIR not set"};
+    StaticConfig fixed;
+    fixed.maxSources = 2;
+    fixed.maxIrDuration = 0.25f;
+    PhononContext context;
+    std::string error;
+    SA_CHECK(context.Initialize(fixed, {dir}, error));
+    HRTFRenderer renderer;
+    SA_CHECK(renderer.Initialize(context, {}, fixed, error));
+    SoundSource source(45, SourceKind::EngineChannel, 1, 44100, 44100, 8192);
+    SourceParams params;
+    params.position = {200.f, 0.f, 32.f};
+    params.positionValid = 1;
+    source.SetParams(params);
+    ListenerState listener;
+    listener.valid = true;
+    listener.frame = CoordinateConverter{}.FrameToSA({0.f, 0.f, 32.f}, {1.f, 0.f, 0.f}, {0.f, 0.f, 1.f});
+    RuntimeConfig runtime;
+    runtime.reflections = runtime.pathing = false;
+    std::vector<float> pcm(fixed.frameSize);
+    const float* input[] = {pcm.data()};
+    const auto render = [&](bool captured) {
+        params.engineGainValid = captured ? 1 : 0;
+        params.engineDirectGain = 0.025f;
+        source.SetParams(params);
+        source.Render().gainInitialized = false;
+        if (source.Render().effects) source.Render().effects->Reset();
+        double energy = 0.0;
+        for (int frame = 0; frame < 8; ++frame) {
+            std::fill(pcm.begin(), pcm.end(), 0.f);
+            if (frame == 0) pcm[0] = 0.5f;
+            renderer.BeginFrame(runtime, listener);
+            renderer.RenderSource(source, input, 1, 1.f);
+            renderer.EndFrame();
+            for (int i = 0; i < fixed.frameSize; ++i)
+                energy += renderer.MasterLeft()[i] * renderer.MasterLeft()[i] + renderer.MasterRight()[i] * renderer.MasterRight()[i];
+        }
+        return energy;
+    };
+    for (bool hrtf : {false, true}) {
+        runtime.hrtf = hrtf;
+        const double open = render(false), captured = render(true);
+        SA_CHECK(open > 0.0 && captured > 0.0);
+        SA_CHECK_NEAR(std::sqrt(captured / open), 0.025, 0.0005);
+    }
+    renderer.ReleaseEffects(source.Render().effects);
+    source.Render().effects = nullptr;
+}
+
+SA_TEST(HrtfRenderer_PathingDoesNotDuplicateVisibleDirectSound)
+{
+    const char* dir = PhononDir();
+    if (!dir) throw satest::Skipped{"SA_PHONON_DIR not set"};
+    StaticConfig fixed;
+    fixed.maxSources = 2;
+    fixed.maxIrDuration = 0.25f;
+    PhononContext context;
+    std::string error;
+    SA_CHECK(context.Initialize(fixed, {dir}, error));
+    Simulator simulator;
+    SA_CHECK(simulator.Initialize(context, {}, fixed, error));
+    SoundSource source(46, SourceKind::Procedural, 1, 44100, 44100, 8192);
+    SourceParams params;
+    params.position = {200.f, 0.f, 32.f};
+    params.positionValid = 1;
+    source.SetParams(params);
+    SA_CHECK(simulator.CreateSource(source));
+    source.MarkSimulationReady(static_cast<IPLSimulationFlags>(IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_PATHING));
+    SimulationOutputOverride injected(source.Sim().source);
+    auto& outputs = injected.outputs;
+    outputs.direct.distanceAttenuation = outputs.direct.directivity = outputs.direct.occlusion = 1.f;
+    for (float& band : outputs.direct.airAbsorption) band = 1.f;
+    for (float& band : outputs.pathing.eqCoeffs) band = 1.f;
+    float sh[4] = {1.f, 0.f, 0.f, 0.f};
+    outputs.pathing.shCoeffs = sh;
+    outputs.pathing.order = 0;
+    outputs.pathing.normalizeEQ = IPL_TRUE;
+    HRTFRenderer renderer;
+    SA_CHECK(renderer.Initialize(context, {}, fixed, error));
+    ListenerState listener;
+    listener.valid = true;
+    listener.frame = CoordinateConverter{}.FrameToSA({0.f, 0.f, 32.f}, {1.f, 0.f, 0.f}, {0.f, 0.f, 1.f});
+    RuntimeConfig runtime;
+    runtime.hrtf = runtime.reflections = false;
+    std::vector<float> pcm(fixed.frameSize);
+    const float* input[] = {pcm.data()};
+    const auto render = [&] {
+        if (source.Render().effects) source.Render().effects->Reset();
+        uint32_t seed = 513;
+        double energy = 0.0;
+        for (int frame = 0; frame < 24; ++frame) {
+            for (float& sample : pcm) {
+                seed = seed * 1664525u + 1013904223u;
+                sample = (static_cast<float>(seed >> 8) / 8388608.f - 1.f) * 0.25f;
+            }
+            renderer.BeginFrame(runtime, listener);
+            renderer.RenderSource(source, input, 1, 1.f);
+            renderer.EndFrame();
+            if (frame >= 8)
+                for (int i = 0; i < fixed.frameSize; ++i)
+                    energy += renderer.MasterLeft()[i] * renderer.MasterLeft()[i] + renderer.MasterRight()[i] * renderer.MasterRight()[i];
+        }
+        return energy;
+    };
+    runtime.pathing = false;
+    const double direct = render();
+    runtime.pathing = true;
+    const double combined = render();
+    SA_CHECK(direct > 0.0);
+    SA_CHECK_NEAR(combined / direct, 1.0, 0.005);
+    outputs.direct.occlusion = 0.f;
+    runtime.directGain = 0.f;
+    const double path = render();
+    for (float& band : outputs.pathing.eqCoeffs) band = 0.1f;
+    const double attenuatedPath = render();
+    SA_CHECK(path > 0.0 && attenuatedPath > 0.0);
+    SA_CHECK_NEAR(std::sqrt(attenuatedPath / path), 0.1, 0.005);
+    renderer.ReleaseEffects(source.Render().effects);
+    source.Render().effects = nullptr;
+    simulator.DestroySource(source);
+    simulator.ProcessDeferredReleases(true);
+}
+
+SA_TEST(HrtfRenderer_TwoRoomsRespectDoorAndMaterial)
+{
+    const char* dir = PhononDir();
+    if (!dir) throw satest::Skipped{"SA_PHONON_DIR not set"};
+    StaticConfig fixed;
+    fixed.maxSources = 2;
+    fixed.maxRays = 2048;
+    fixed.maxIrDuration = 0.25f;
+    fixed.simulationThreads = 1;
+    PhononContext context;
+    std::string error;
+    SA_CHECK(context.Initialize(fixed, {dir}, error));
+    BackendDevices devices;
+    GPUBackend gpu;
+    if (std::getenv("SA_TEST_GPU")) {
+        fixed.sceneType = SceneTypePreference::RadeonRays;
+        fixed.enableTan = false;
+        fixed.gpuComputeUnits = 0;
+        SA_CHECK(gpu.Initialize(context, fixed, error));
+        devices = gpu.Devices();
+    }
+    TwoRoomScene fixture;
+    CoordinateConverter converter;
+    SceneBuilder scene;
+    SA_CHECK(scene.Initialize(context, devices));
+    SA_CHECK(scene.AddStaticMesh(fixture.walls, "two_rooms"));
+    const auto door = scene.AddDynamic(fixture.door, converter.TransformToSA(Transform{}), "door");
+    SA_CHECK(door != SceneBuilder::kInvalidDynamic);
+    scene.Commit();
+    Simulator simulator;
+    SA_CHECK(simulator.Initialize(context, devices, fixed, error));
+    simulator.SetScene(scene.Scene());
+    ReflectionSimulator reflections;
+    SA_CHECK(reflections.Initialize(context, simulator, fixed, devices));
+    auto geometry = std::make_shared<BspGeometry>();
+    geometry->world = fixture.walls;
+    geometry->world.Append(fixture.door);
+    RuntimeConfig runtime;
+    runtime.hrtf = false;
+    runtime.pathing = false;
+    runtime.irDuration = 0.2f;
+    runtime.numRays = 2048;
+    runtime.numBounces = 8;
+    runtime.bakeRays = 512;
+    runtime.bakeBounces = 8;
+    runtime.bakeDuration = 0.2f;
+    runtime.probeSpacing = 2.f;
+    SA_CHECK(reflections.StartBake(geometry, runtime, "", {}));
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (reflections.BakeInProgress() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    SA_CHECK(!reflections.BakeInProgress());
+    SA_CHECK(reflections.PollBake());
+    SoundSource source(44, SourceKind::Procedural, 1, 44100, 44100, 8192);
+    SourceParams params;
+    params.positionValid = 1;
+    params.position = converter.PositionToSource({-2.f, 1.5f, 0.f});
+    source.SetParams(params);
+    SA_CHECK(simulator.CreateSource(source));
+    HRTFRenderer renderer;
+    SA_CHECK(renderer.Initialize(context, devices, fixed, error));
+    ListenerState listener;
+    listener.valid = true;
+    listener.frame = converter.FrameToSA(converter.PositionToSource({2.f, 1.5f, 0.f}), {-1.f, 0.f, 0.f}, {0.f, 0.f, 1.f});
+    const auto flags = static_cast<IPLSimulationFlags>(IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_REFLECTIONS);
+    IPLSimulationSharedInputs shared{};
+    shared.listener = listener.frame;
+    reflections.FillSharedInputs(runtime, shared);
+    simulator.SetSharedInputs(flags, shared);
+    IPLDirectEffect reference = nullptr;
+    IPLDirectEffectSettings referenceSettings{1};
+    SA_CHECK(iplDirectEffectCreate(context.Handle(), context.MutableAudioSettings(), &referenceSettings, &reference) == IPL_STATUS_SUCCESS);
+    struct Result { double direct = 0.0, reference = 0.0, reflections = 0.0; float visibility = 0.f; };
+    std::vector<float> pcm(fixed.frameSize), referencePcm(fixed.frameSize);
+    const float* input[] = {pcm.data()};
+    float* refInput[] = {pcm.data()};
+    float* refOutput[] = {referencePcm.data()};
+    IPLAudioBuffer inBuffer{1, fixed.frameSize, refInput}, outBuffer{1, fixed.frameSize, refOutput};
+    float distanceMultiplier = 0.f;
+    const auto measure = [&](bool closed) {
+        Transform transform;
+        transform.origin = converter.PositionToSource({0.f, closed ? 0.f : 5.f, 0.f});
+        scene.UpdateDynamic(door, converter.TransformToSA(transform));
+        scene.Commit();
+        IPLSimulationInputs in{};
+        in.flags = flags;
+        in.directFlags = static_cast<IPLDirectSimulationFlags>(IPL_DIRECTSIMULATIONFLAGS_DISTANCEATTENUATION |
+                            IPL_DIRECTSIMULATIONFLAGS_AIRABSORPTION | IPL_DIRECTSIMULATIONFLAGS_OCCLUSION |
+                            IPL_DIRECTSIMULATIONFLAGS_TRANSMISSION);
+        in.source = converter.FrameToSA(params.position, {1.f, 0.f, 0.f}, {0.f, 0.f, 1.f});
+        in.distanceAttenuationModel.type = IPL_DISTANCEATTENUATIONTYPE_CALLBACK;
+        in.distanceAttenuationModel.callback = &TestDistanceCallback;
+        in.distanceAttenuationModel.userData = &distanceMultiplier;
+        in.distanceAttenuationModel.dirty = IPL_TRUE;
+        in.airAbsorptionModel.type = IPL_AIRABSORPTIONTYPE_DEFAULT;
+        in.occlusionType = IPL_OCCLUSIONTYPE_RAYCAST;
+        in.numOcclusionSamples = in.numTransmissionRays = 1;
+        reflections.FillSourceInputs(runtime, params, in);
+        iplSourceSetInputs(source.Sim().source, flags, &in);
+        simulator.Commit();
+        simulator.RunDirect();
+        simulator.RunReflections();
+        source.MarkSimulationReady(flags);
+        IPLSimulationOutputs outputs{};
+        iplSourceGetOutputs(source.Sim().source, flags, &outputs);
+        Result result;
+        result.visibility = outputs.direct.occlusion;
+        IPLDirectEffectParams direct = outputs.direct;
+        direct.flags = static_cast<IPLDirectEffectFlags>(IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION |
+                           IPL_DIRECTEFFECTFLAGS_APPLYDIRECTIVITY | IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION |
+                           IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION);
+        direct.transmissionType = IPL_TRANSMISSIONTYPE_FREQDEPENDENT;
+        iplDirectEffectReset(reference);
+        if (source.Render().effects) source.Render().effects->Reset();
+        RuntimeConfig dry = runtime;
+        dry.reflections = false;
+        uint32_t seed = 931;
+        for (int frame = 0; frame < 24; ++frame) {
+            for (float& sample : pcm) {
+                seed = seed * 1664525u + 1013904223u;
+                sample = (static_cast<float>(seed >> 8) / 8388608.f - 1.f) * 0.25f;
+            }
+            iplDirectEffectApply(reference, &direct, &inBuffer, &outBuffer);
+            renderer.BeginFrame(dry, listener);
+            renderer.RenderSource(source, input, 1, 1.f);
+            renderer.EndFrame();
+            if (frame >= 8)
+                for (int i = 0; i < fixed.frameSize; ++i) {
+                    result.direct += renderer.MasterLeft()[i] * renderer.MasterLeft()[i] + renderer.MasterRight()[i] * renderer.MasterRight()[i];
+                    result.reference += referencePcm[i] * referencePcm[i];
+                }
+        }
+        source.Render().effects->Reset();
+        RuntimeConfig wet = runtime;
+        wet.directGain = 0.f;
+        for (int frame = 0; frame < 64; ++frame) {
+            std::fill(pcm.begin(), pcm.end(), 0.f);
+            if (frame == 0) pcm[0] = 0.5f;
+            renderer.BeginFrame(wet, listener);
+            renderer.RenderSource(source, input, 1, 1.f);
+            renderer.EndFrame();
+            for (int i = 0; i < fixed.frameSize; ++i)
+                result.reflections += renderer.MasterLeft()[i] * renderer.MasterLeft()[i] + renderer.MasterRight()[i] * renderer.MasterRight()[i];
+        }
+        return result;
+    };
+    const Result closed = measure(true), open = measure(false), closedAgain = measure(true);
+    scene.ClearDynamic();
+    scene.ClearStatic();
+    scene.Commit();
+    const Result empty = measure(false);
+    iplDirectEffectRelease(&reference);
+    renderer.ReleaseEffects(source.Render().effects);
+    source.Render().effects = nullptr;
+    simulator.DestroySource(source);
+    simulator.ProcessDeferredReleases(true);
+    const double measuredDb = 10.0 * std::log10(closed.direct / open.direct);
+    const double materialDb = 10.0 * std::log10(closed.reference / open.reference);
+    std::printf("    two rooms: direct closed/open %.2f dB, material reference %.2f dB; reflections closed/open %g/%g\n",
+                measuredDb, materialDb, closed.reflections, open.reflections);
+    SA_CHECK_NEAR(closed.visibility, 0.f, 1e-6);
+    SA_CHECK_NEAR(open.visibility, 1.f, 1e-6);
+    SA_CHECK(closed.direct > 0.0 && open.direct > closed.direct);
+    SA_CHECK_NEAR(measuredDb, materialDb, 0.2);
+    SA_CHECK(open.reflections > 1e-8);
+    SA_CHECK(closed.reflections < open.reflections * 0.01 + 1e-9);
+    SA_CHECK(closedAgain.reflections < open.reflections * 0.01 + 1e-9);
+    SA_CHECK_NEAR(closedAgain.direct / closed.direct, 1.0, 0.02);
+    SA_CHECK_NEAR(empty.visibility, 1.f, 1e-6);
+    SA_CHECK(empty.reflections < open.reflections * 0.01 + 1e-9);
 }
 
 SA_TEST(HrtfRenderer_SimulatedDirectPathKeepsLevel)
@@ -495,6 +1046,13 @@ SA_TEST(ReflectionBake_UsesAnIndependentScene)
     SA_CHECK(reflections.HasBakedData());
     SA_CHECK(!reflections.PathingBaked());
     SA_CHECK(reflections.ProbeCount() > 0);
+    SourceParams emitter;
+    IPLSimulationInputs reflectionInputs{};
+    reflections.FillSourceInputs(runtime, emitter, reflectionInputs);
+    SA_CHECK(reflectionInputs.baked == IPL_FALSE);
+    emitter.listenerRelative = 1;
+    reflections.FillSourceInputs(runtime, emitter, reflectionInputs);
+    SA_CHECK(reflectionInputs.baked == IPL_TRUE);
     SA_CHECK_EQ(live.StaticTriangleCount(), size_t(0));
     BakeStatus status = reflections.Status();
     SA_CHECK(status.phase == BakePhase::Ready);
