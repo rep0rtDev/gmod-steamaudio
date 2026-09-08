@@ -255,6 +255,26 @@ index ebe24e5..9c5e93e 100644
 +    return error.c_str();
 +}
 +}
+diff --git a/core/src/core/array_math.cpp b/core/src/core/array_math.cpp
+index 58a2352..3265964 100644
+--- a/core/src/core/array_math.cpp
++++ b/core/src/core/array_math.cpp
+@@ -1,5 +1,5 @@
+ //
+-// Copyright 2017-2023 Valve Corporation.
++// Copyright 2017-2023 Valve Corporation. Modified for gmod-steamaudio: unaligned SIMD accumulation, 2026.
+ //
+ // Licensed under the Apache License, Version 2.0 (the "License");
+ // you may not use this file except in compliance with the License.
+@@ -257,7 +257,7 @@ void ArrayMath::multiplyAccumulate(int size,
+ 
+             auto y = float4::add(float4::mul(b1, x2), float4::mul(b0, float4::mul(b3, b4)));
+ 
+-            y = float4::add(y, float4::load(&outData[i]));
++            y = float4::add(y, float4::loadu(&outData[i]));
+ 
+             float4::storeu(&outData[i], y);
+         }
 diff --git a/core/src/core/path_data.cpp b/core/src/core/path_data.cpp
 index cbc0af6..b637a39 100644
 --- a/core/src/core/path_data.cpp

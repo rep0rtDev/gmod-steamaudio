@@ -19,9 +19,10 @@
 #include <initguid.h>
 #include <audioclient.h>
 #include <avrt.h>
-#include <functiondiscoverykeys_devpkey.h>
 #include <mmdeviceapi.h>
 #include <mmreg.h>
+#include <propkeydef.h>
+#include <functiondiscoverykeys_devpkey.h>
 
 #include <algorithm>
 #include <atomic>

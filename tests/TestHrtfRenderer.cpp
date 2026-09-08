@@ -317,14 +317,19 @@ SA_TEST(ReflectionBake_UsesAnIndependentScene)
     SA_CHECK(ctx.Initialize(fixed, {dir}, error));
     CPUFallbackBackend backend;
     SA_CHECK(backend.Initialize(ctx, fixed, error));
-    Simulator simulator;
-    const BackendDevices devices = backend.Devices();
-    SA_CHECK(simulator.Initialize(ctx, devices, fixed, error));
+    BackendDevices devices = backend.Devices();
     auto geometry = std::make_shared<BspGeometry>();
     const auto bytes = satest::MakeRoomBsp();
     SA_CHECK(ParseBsp(bytes.data(), bytes.size(), CoordinateConverter{}, MaterialLibrary{}, {}, *geometry));
     SceneBuilder live;
     SA_CHECK(live.Initialize(ctx, devices));
+    devices.sceneType = live.SceneType();
+    if (devices.sceneType == IPL_SCENETYPE_DEFAULT)
+        devices.embree = nullptr;
+    Simulator simulator;
+    SA_CHECK(simulator.Initialize(ctx, devices, fixed, error));
+    SA_CHECK(simulator.SupportsReflections());
+    SA_CHECK(simulator.SupportsPathing());
     SA_CHECK(live.AddStaticMesh(geometry->world, "live"));
     live.Commit();
     simulator.SetScene(live.Scene());
@@ -361,7 +366,7 @@ SA_TEST(ReflectionBake_UsesAnIndependentScene)
     BakeStatus status = reflections.Status();
     SA_CHECK(status.phase == BakePhase::Ready);
     SA_CHECK_EQ(status.completedProbes, reflections.ProbeCount());
-    SA_CHECK_EQ(status.sceneType, devices.sceneType);
+    SA_CHECK_EQ(status.sceneType, live.SceneType());
     SA_CHECK(!status.active);
     struct CacheFile {
         std::string path;

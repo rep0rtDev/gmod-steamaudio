@@ -79,6 +79,29 @@ def configure(args, source, build, enabled):
          '-A', 'x64', '-DSTEAMAUDIO_ENABLE_TRUEAUDIONEXT=' + ('ON' if enabled else 'OFF')])
 
 
+def check_array_math(args, root):
+    sdk = (args.sdk_root / 'core/src/core').resolve().as_posix()
+    test = Path(__file__).with_name('TestSdkArrayMath.cpp').resolve().as_posix()
+    for architecture in ('x64', 'Win32'):
+        source = root / ('array-math-' + architecture) / 'source'
+        build = source.parent / 'build'
+        source.mkdir(parents=True)
+        project = f'''cmake_minimum_required(VERSION 3.20)
+project(SdkArrayMathFixture LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+add_executable(sdk_array_math_test "{test}" "{sdk}/array_math.cpp")
+target_include_directories(sdk_array_math_test PRIVATE "{sdk}")
+target_compile_options(sdk_array_math_test PRIVATE /Ox /EHsc /W3)
+set_source_files_properties("{test}" PROPERTIES COMPILE_OPTIONS "/W4;/WX")
+'''
+        (source / 'CMakeLists.txt').write_text(project, encoding='utf-8')
+        run([args.cmake, '-S', str(source), '-B', str(build), '-G', 'Visual Studio 17 2022', '-A', architecture])
+        run([args.cmake, '--build', str(build), '--config', 'RelWithDebInfo', '--parallel', '2'])
+        _, output = run([str(build / 'RelWithDebInfo/sdk_array_math_test.exe')])
+        print(architecture + ': ' + output.strip().splitlines()[-1], flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--sdk-root', type=Path, required=True)
@@ -92,6 +115,7 @@ def main():
     configurations = ('RelWithDebInfo', 'Release', 'Debug', 'MinSizeRel')
     with tempfile.TemporaryDirectory(prefix='sa-sdk-install-', dir=args.work_dir) as temporary:
         root = Path(temporary)
+        check_array_math(args, root)
         for enabled in (False, True):
             label = 'enabled' if enabled else 'disabled'
             source, build = prepare(root / label, install_rules, delay_rules, enabled)

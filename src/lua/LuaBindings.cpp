@@ -596,6 +596,7 @@ LUA_FUNCTION(L_GetSurfaceProp)
 
 LUA_FUNCTION(L_UnloadMap)
 {
+    (void)LUA;
     if (g_engine)
         g_engine->UnloadMap();
     return 0;
@@ -615,6 +616,7 @@ LUA_FUNCTION(L_UpdateBrushModel)
 // validated): BeginEntities(); PushEntity(...) per entity; EndEntities().
 LUA_FUNCTION(L_BeginEntities)
 {
+    (void)LUA;
     if (g_engine)
         g_engine->BeginLuaEntities();
     return 0;
@@ -641,6 +643,7 @@ LUA_FUNCTION(L_PushEntity)
 
 LUA_FUNCTION(L_EndEntities)
 {
+    (void)LUA;
     if (g_engine)
         g_engine->EndLuaEntities();
     return 0;
@@ -1173,6 +1176,7 @@ LUA_FUNCTION(L_RemoveSoundRule)
 // steamaudio.ClearSoundRules()
 LUA_FUNCTION(L_ClearSoundRules)
 {
+    (void)LUA;
     if (g_engine)
         g_engine->SoundOverrides().ClearRules();
     return 0;
@@ -1204,6 +1208,7 @@ LUA_FUNCTION(L_GetSoundRules)
 // steamaudio.ClearSoundOverrides()
 LUA_FUNCTION(L_ClearSoundOverrides)
 {
+    (void)LUA;
     if (g_engine)
         g_engine->SoundOverrides().ClearAll();
     return 0;
