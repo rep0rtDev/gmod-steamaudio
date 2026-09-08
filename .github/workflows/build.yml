@@ -1,0 +1,221 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sdk-windows:
+    name: Paged Steam Audio SDK x64
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 2
+      MSBUILDDISABLENODEREUSE: 1
+      _CL_: /MP1
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: ValveSoftware/steam-audio
+          ref: 0da18255cca520771f363ee01f100572b39a308e
+          path: third_party/steamaudio/source
+          sparse-checkout: core
+          persist-credentials: false
+      - name: Select compatible CMake
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $cmake = "$vs\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin"
+          if (-not (Test-Path "$cmake\cmake.exe")) { throw "Visual Studio CMake not found" }
+          $cmake | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & "$cmake\cmake.exe" --version
+      - name: Apply bounded-memory SDK changes
+        shell: pwsh
+        run: |
+          git -C third_party/steamaudio/source apply --check "$env:GITHUB_WORKSPACE/third_party/steamaudio/paged-pathing.patch"
+          if ($LASTEXITCODE -ne 0) { throw "SDK patch does not match the pinned source" }
+          git -C third_party/steamaudio/source apply "$env:GITHUB_WORKSPACE/third_party/steamaudio/paged-pathing.patch"
+          if ($LASTEXITCODE -ne 0) { throw "SDK patch failed" }
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684
+        with:
+          path: |
+            third_party/steamaudio/source/core/deps
+            third_party/steamaudio/source/core/deps-build
+          key: sdk-v481-vs2022-x64-${{ hashFiles('third_party/steamaudio/source/core/build/dependencies.json', 'third_party/steamaudio/source/core/build/get_dependencies.py') }}
+      - name: Build resource-limited launcher
+        shell: pwsh
+        run: |
+          cmake -S . -B host-tools -G "Visual Studio 17 2022" -A x64 -DSA_BUILD_TESTS=OFF -DSA_WARNINGS_AS_ERRORS=ON
+          if ($LASTEXITCODE -ne 0) { throw "Launcher configure failed" }
+          cmake --build host-tools --config Release --target sa_run_limited --parallel 2
+          if ($LASTEXITCODE -ne 0) { throw "Launcher build failed" }
+      - name: Build SDK dependencies
+        shell: pwsh
+        run: |
+          $python = (Get-Command python).Source
+          $work = "$env:GITHUB_WORKSPACE/third_party/steamaudio/source/core/build"
+          foreach ($dependency in @('flatbuffers','pffft','zlib','mysofa','ispc','embree','opencl','radeonrays')) {
+            & host-tools/Release/sa_run_limited.exe --memory-mb 6144 --cpu-percent 90 --workdir $work -- $python "$work/get_dependencies.py" --platform windows --architecture x64 --toolchain vs2022 --extra --dependency $dependency
+            if ($LASTEXITCODE -ne 0) { throw "Dependency failed: $dependency" }
+          }
+      - name: Build patched SDK
+        shell: pwsh
+        run: |
+          cmake -S third_party/steamaudio/source/core -B sdk-build -G "Visual Studio 17 2022" -A x64 -DSA_GMOD_SOURCE_DIR="$env:GITHUB_WORKSPACE/src" -DSTEAMAUDIO_BUILD_TESTS=OFF -DSTEAMAUDIO_BUILD_BENCHMARKS=OFF -DSTEAMAUDIO_BUILD_ITESTS=OFF -DSTEAMAUDIO_BUILD_SAMPLES=OFF -DSTEAMAUDIO_BUILD_DOCS=OFF -DSTEAMAUDIO_ENABLE_IPP=OFF -DSTEAMAUDIO_ENABLE_EMBREE=ON -DSA_REQUIRE_EMBREE=ON -DSTEAMAUDIO_ENABLE_RADEONRAYS=ON -DSA_REQUIRE_RADEONRAYS=ON -DSTEAMAUDIO_ENABLE_TRUEAUDIONEXT=OFF
+          if ($LASTEXITCODE -ne 0) { throw "SDK configure failed" }
+          $cmake = (Get-Command cmake).Source
+          & host-tools/Release/sa_run_limited.exe --memory-mb 6144 --cpu-percent 90 --workdir $env:GITHUB_WORKSPACE -- $cmake --build sdk-build --config RelWithDebInfo --target phonon --parallel 2
+          if ($LASTEXITCODE -ne 0) { throw "SDK build failed" }
+          cmake --install sdk-build --config RelWithDebInfo --prefix sdk-install
+          if ($LASTEXITCODE -ne 0) { throw "SDK install failed" }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: steamaudio-paged-win64
+          path: sdk-install
+          if-no-files-found: error
+          retention-days: 14
+
+  msvc:
+    name: MSVC ${{ matrix.arch }}
+    needs: sdk-windows
+    runs-on: windows-2022
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86
+            cmake_arch: Win32
+            module: gmcl_steamaudio_win32
+          - arch: x64
+            cmake_arch: x64
+            module: gmcl_steamaudio_win64
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: matrix.arch == 'x64'
+        with:
+          name: steamaudio-paged-win64
+          path: sdk
+      - name: Configure
+        shell: pwsh
+        run: |
+          $runtime = @()
+          if ('${{ matrix.arch }}' -eq 'x64') {
+            $dll = Get-ChildItem sdk -Filter phonon.dll -Recurse | Select-Object -First 1
+            if (-not $dll) { throw "Patched phonon.dll missing" }
+            "SA_PHONON_DIR=$($dll.DirectoryName)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+            "SA_REQUIRE_PAGED_PATHING=1" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+            $runtime = @("-DSA_BUNDLE_RUNTIME_DIR=$($dll.DirectoryName)")
+          }
+          cmake -S . -B build -G "Visual Studio 17 2022" -A ${{ matrix.cmake_arch }} -DSA_WARNINGS_AS_ERRORS=ON @runtime
+          if ($LASTEXITCODE -ne 0) { throw "Module configure failed" }
+      - name: Build
+        run: cmake --build build --config Release --parallel 2
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Verify exports
+        shell: pwsh
+        run: |
+          $dll = "build/Release/${{ matrix.module }}.dll"
+          if (-not (Test-Path $dll)) { throw "missing $dll" }
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+          $exports = & $dumpbin.FullName /EXPORTS $dll
+          if (-not ($exports -match "gmod13_open") -or -not ($exports -match "gmod13_close")) { throw "GMod entry points missing" }
+      - name: Package development build
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          cmake --install build --config Release --prefix package/garrysmod
+          if ($LASTEXITCODE -ne 0) { throw "Module install failed" }
+          Compress-Archive -Path package/garrysmod -DestinationPath gmod-steamaudio-win64-development.zip
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ matrix.module }}-msvc-development
+          path: |
+            build/Release/${{ matrix.module }}.dll
+            build/Release/${{ matrix.module }}.pdb
+            gmod-steamaudio-win64-development.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  mingw:
+    name: MinGW ${{ matrix.arch }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86
+            triplet: i686-w64-mingw32
+            module: gmcl_steamaudio_win32
+          - arch: x64
+            triplet: x86_64-w64-mingw32
+            module: gmcl_steamaudio_win64
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build mingw-w64 g++-mingw-w64
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_SYSTEM_NAME=Windows
+          -DCMAKE_C_COMPILER=${{ matrix.triplet }}-gcc-posix
+          -DCMAKE_CXX_COMPILER=${{ matrix.triplet }}-g++-posix
+          -DCMAKE_RC_COMPILER=${{ matrix.triplet }}-windres
+          -DCMAKE_FIND_ROOT_PATH=/usr/${{ matrix.triplet }}
+          -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
+          -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
+          -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
+          -DSA_BUILD_TESTS=OFF -DSA_WARNINGS_AS_ERRORS=ON
+      - name: Build
+        run: cmake --build build --parallel 2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ matrix.module }}-mingw-development
+          path: build/${{ matrix.module }}.dll
+          if-no-files-found: error
+          retention-days: 14
+
+  linux:
+    name: Linux compile-check and tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build g++
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DSA_WARNINGS_AS_ERRORS=ON
+      - name: Build
+        run: cmake --build build --parallel 2
+      - name: Fetch reference Steam Audio runtime
+        run: |
+          curl --fail --location --output steamaudio.zip https://github.com/ValveSoftware/steam-audio/releases/download/v4.8.1/steamaudio_4.8.1.zip
+          unzip -q steamaudio.zip 'steamaudio/lib/linux-x64/*' -d sdk
+          echo "SA_PHONON_DIR=$PWD/sdk/steamaudio/lib/linux-x64" >> "$GITHUB_ENV"
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

@@ -1,0 +1,68 @@
+{
+  "engine_module": "engine.dll",
+  "client_module": "client.dll",
+  "bass_module": "bass.dll",
+  "engine_sound_interface": "IEngineSoundClient003",
+  "allow_unvalidated_device": false,
+  "disable_mixer_hooks": false,
+  "disable_bass_hooks": false,
+  "disable_emitsound_hook": false,
+
+  "audio_device": {
+    "rtti_classes": [
+      "CAudioDirectSound",
+      "CAudioXAudio2",
+      "CAudioWasapi",
+      "CAudioDeviceWave",
+      "CAudioMMSystem",
+      "CAudioDeviceNull"
+    ],
+    "expected_slot_count": { "x86": 33, "x64": 33 },
+    "vtable_slots": {
+      "x86": {},
+      "x64": {}
+    },
+    "g_AudioDevice": {
+      "x86": { "pattern": "", "offset": 0, "length": 0, "mode": "absolute", "deref": 1, "section": ".text" },
+      "x64": { "pattern": "", "offset": 0, "length": 0, "mode": "relative", "deref": 1, "section": ".text" }
+    }
+  },
+
+  "paint_buffer": {
+    "x86": { "pattern": "", "offset": 0, "length": 0, "mode": "absolute", "deref": 0, "section": ".text" },
+    "x64": { "pattern": "", "offset": 0, "length": 0, "mode": "relative", "deref": 0, "section": ".text" }
+  },
+
+  "channel_layout": {
+    "x86": { "origin": -1, "guid": -1, "dist_mult": -1, "fvolume": -1, "master_vol": -1, "stride": -1 },
+    "x64": { "origin": -1, "guid": -1, "dist_mult": -1, "fvolume": -1, "master_vol": -1, "stride": -1 }
+  },
+
+  "filesystem": {
+    "module": "filesystem_stdio.dll",
+    "interface": "VFileSystem022",
+    "path_id": "GAME",
+    "probe_file": "gameinfo.txt",
+    "probe_token": "GameInfo",
+    "disabled": false,
+    "gma_directories": ["addons", "cache/workshop", "cache"],
+    "slots": {
+      "x86": { "this_offset": 1, "read": -1, "open": -1, "close": -1, "seek": -1, "tell": -1, "size_handle": -1, "size_name": -1, "file_exists": -1, "filename_string": -1 },
+      "x64": { "this_offset": 1, "read": -1, "open": -1, "close": -1, "seek": -1, "tell": -1, "size_handle": -1, "size_name": -1, "file_exists": -1, "filename_string": -1 }
+    }
+  },
+  "entity_list": {
+    "_comment": "IClientEntityList / IClientEntity / ICollideable / IClientNetworkable slot indices. Defaults are Source SDK 2013 declaration order, NOT verified against the GMod client; the module validates them in-map (world entity, map model name, SOLID_BSP, local player class) and falls back to the Lua entity walk when validation fails.",
+    "module": "client.dll",
+    "interface": "VClientEntityList003",
+    "modelinfo_module": "engine.dll",
+    "modelinfo_interfaces": ["VModelInfoClient006", "VModelInfoClient004"],
+    "player_class_suffixes": ["Player"],
+    "max_entities": 16384,
+    "disabled": false,
+    "slots": {
+      "x86": { "get_client_entity": 3, "get_highest_entity_index": 6, "get_collideable": 3, "get_client_networkable": 4, "obb_mins": 3, "obb_maxs": 4, "get_collision_model": 9, "get_collision_origin": 10, "get_collision_angles": 11, "get_solid": 13, "get_client_class": 2, "is_dormant": 8, "network_name_pointer_index": 2, "get_model_name": 3 },
+      "x64": { "get_client_entity": 3, "get_highest_entity_index": 6, "get_collideable": 3, "get_client_networkable": 4, "obb_mins": 3, "obb_maxs": 4, "get_collision_model": 9, "get_collision_origin": 10, "get_collision_angles": 11, "get_solid": 13, "get_client_class": 2, "is_dormant": 8, "network_name_pointer_index": 2, "get_model_name": 3 }
+    }
+  }
+}

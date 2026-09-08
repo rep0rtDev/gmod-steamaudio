@@ -1,0 +1,711 @@
+diff --git a/core/CMakeLists.txt b/core/CMakeLists.txt
+index 5f9bb6a..8f4334b 100644
+--- a/core/CMakeLists.txt
++++ b/core/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-# Copyright 2017-2023 Valve Corporation.
++# Copyright 2017-2023 Valve Corporation. Modified for gmod-steamaudio backend requirements, 2026.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+@@ -265,6 +265,14 @@ if (STEAMAUDIO_ENABLE_RADEONRAYS)
+     endif()
+ endif()
+ 
++if (SA_REQUIRE_EMBREE AND NOT STEAMAUDIO_ENABLE_EMBREE)
++    message(FATAL_ERROR "The requested Embree backend could not be built")
++endif()
++
++if (SA_REQUIRE_RADEONRAYS AND NOT STEAMAUDIO_ENABLE_RADEONRAYS)
++    message(FATAL_ERROR "The requested Radeon Rays backend could not be built")
++endif()
++
+ if (STEAMAUDIO_ENABLE_TRUEAUDIONEXT)
+     find_package(TrueAudioNext)
+     if (NOT TrueAudioNext_FOUND)
+diff --git a/core/build/dependencies.json b/core/build/dependencies.json
+index 89a3a70..5254489 100644
+--- a/core/build/dependencies.json
++++ b/core/build/dependencies.json
+@@ -423,6 +423,7 @@
+         ]
+     },
+     "radeonrays": {
++        "gmod_modification_notice": "Modified for gmod-steamaudio: build with Visual Studio 2022, 2026",
+         "type": "extra",
+         "platforms": ["windows-x64"],
+         "check": {
+@@ -460,7 +461,7 @@
+             "custom": {
+                 "working_directory": "$src/radeonrays",
+                 "commands": [
+-                    [ "$msbuild:2015", "RadeonRays.sln", "-property:Platform=x64", "-property:Configuration=$Config","-target:RadeonRays" ]
++                    [ "$msbuild:2022", "RadeonRays.sln", "-property:Platform=x64", "-property:Configuration=$Config", "-property:PlatformToolset=v143", "-property:WindowsTargetPlatformVersion=10.0", "-maxcpucount:2", "-target:RadeonRays" ]
+                 ]
+             }
+         },
+diff --git a/core/src/core/CMakeLists.txt b/core/src/core/CMakeLists.txt
+index bff7f30..9fe47ea 100644
+--- a/core/src/core/CMakeLists.txt
++++ b/core/src/core/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-# Copyright 2017-2023 Valve Corporation.
++# Copyright 2017-2023 Valve Corporation. Modified for gmod-steamaudio file-cache integration, 2026.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+@@ -591,6 +591,9 @@ endif()
+ 
+ # This is needed so we can include generated headers
+ target_include_directories(core PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
++set(SA_GMOD_SOURCE_DIR "${CMAKE_HOME_DIRECTORY}/../../../../src" CACHE PATH "GMod paged path cache source directory")
++target_include_directories(core PUBLIC "${SA_GMOD_SOURCE_DIR}")
++target_sources(core PRIVATE "${SA_GMOD_SOURCE_DIR}/steamaudio/PathCacheFile.cpp")
+ 
+ if (IPL_OS_WINDOWS)
+     target_link_libraries(core PUBLIC delayimp)
+diff --git a/core/src/core/api_baking.cpp b/core/src/core/api_baking.cpp
+index ebe24e5..9c5e93e 100644
+--- a/core/src/core/api_baking.cpp
++++ b/core/src/core/api_baking.cpp
+@@ -1,4 +1,4 @@
+-//
++// Modified for gmod-steamaudio: paged pathing API, 2026.
+ // Copyright 2017-2023 Valve Corporation.
+ //
+ // Licensed under the Apache License, Version 2.0 (the "License");
+@@ -123,3 +123,122 @@ void CContext::cancelBakePaths()
+ }
+ 
+ }
++
++namespace {
++const ipl::BakedPathData* FilePathData(void* handle)
++{
++    if (!handle) return nullptr;
++    auto batch = reinterpret_cast<api::CProbeBatch*>(handle)->mHandle.get();
++    if (!batch) return nullptr;
++    ipl::BakedDataIdentifier id;
++    id.type = ipl::BakedDataType::Pathing;
++    id.variation = ipl::BakedDataVariation::Dynamic;
++    return batch->hasData(id) ? &static_cast<const ipl::BakedPathData&>((*batch)[id]) : nullptr;
++}
++}
++
++extern "C" {
++IPLAPI uint32_t SA_PATHCALL saPathCacheVersion() { return 1; }
++
++IPLAPI int32_t SA_PATHCALL saPathCacheConfigure(const char* directory, const char* output, uint64_t key, uint64_t cacheBytes)
++{
++    if (!directory || cacheBytes < 4ull * 1024 * 1024 || cacheBytes > 1024ull * 1024 * 1024) return 1;
++    try {
++        ipl::PathBaker::FileCacheSettings settings;
++        settings.directory = directory;
++        settings.output = output ? output : "";
++        settings.key = key;
++        settings.cacheBytes = cacheBytes;
++        ipl::PathBaker::configureFileCache(settings);
++        return 0;
++    } catch (...) { return 1; }
++}
++
++IPLAPI int32_t SA_PATHCALL saPathCacheLookup(void* batch, int32_t start, int32_t end, sa::PathCacheRecord* out)
++{
++    if (!out) return 0;
++    try {
++        const auto* data = FilePathData(batch);
++        if (!data) return 0;
++        const auto path = data->lookupShortestPath(start, end, nullptr);
++        if (!path.isValid()) return 0;
++        *out = sa::PathCacheRecord{};
++        out->target = static_cast<uint16_t>(end);
++        out->first = path.firstProbe;
++        out->last = path.lastProbe;
++        out->afterFirst = path.probeAfterFirst;
++        out->beforeLast = path.probeBeforeLast;
++        out->flags = path.direct ? 1 : 0;
++        out->distance = path.distanceInternal;
++        out->deviation = path.deviationInternal;
++        return 1;
++    } catch (...) { return 0; }
++}
++
++IPLAPI int32_t SA_PATHCALL saPathCacheStats(void* batch, sa::PathCacheApiStats* out)
++{
++    if (!out) return 0;
++    try {
++        const auto* data = FilePathData(batch);
++        if (!data) return 0;
++        const auto stats = data->fileCacheStats();
++        *out = sa::PathCacheApiStats{};
++        out->probes = stats.probes;
++        out->completedRows = stats.completedRows;
++        out->complete = stats.complete ? 1 : 0;
++        out->residentBytes = stats.residentBytes;
++        out->diskBytes = stats.diskBytes;
++        out->pageReads = stats.pageReads;
++        return 1;
++    } catch (...) { return 0; }
++}
++
++IPLAPI int32_t SA_PATHCALL saPathCacheReadProbes(void* handle, uint32_t capacity, sa::PathCacheProbe* output)
++{
++    if (!handle) return 0;
++    try {
++        const auto batch = reinterpret_cast<api::CProbeBatch*>(handle)->mHandle.get();
++        if (!batch || batch->numProbes() <= 0 || batch->numProbes() > 32768) return 0;
++        const int count = batch->numProbes();
++        if (!output) return count;
++        if (capacity < static_cast<uint32_t>(count)) return 0;
++        for (int i = 0; i < count; ++i) {
++            const auto& p = (*batch)[i].influence;
++            output[i] = sa::PathCacheProbe{p.center[0], p.center[1], p.center[2], p.radius};
++        }
++        return count;
++    } catch (...) { return 0; }
++}
++
++IPLAPI int32_t SA_PATHCALL saPathCacheAttach(void* destination, void* source)
++{
++    if (!destination || !source || destination == source) return 0;
++    try {
++        auto target = reinterpret_cast<api::CProbeBatch*>(destination)->mHandle.get();
++        auto input = reinterpret_cast<api::CProbeBatch*>(source)->mHandle.get();
++        if (!target || !input || target->numProbes() != input->numProbes()) return 0;
++        for (int i = 0; i < target->numProbes(); ++i) {
++            const auto& a = (*target)[i].influence;
++            const auto& b = (*input)[i].influence;
++            if (a.radius != b.radius || a.center[0] != b.center[0] || a.center[1] != b.center[1] || a.center[2] != b.center[2])
++                return 0;
++        }
++        ipl::BakedDataIdentifier id;
++        id.type = ipl::BakedDataType::Pathing;
++        id.variation = ipl::BakedDataVariation::Dynamic;
++        auto& data = input->getData();
++        auto entry = data.find(id);
++        if (entry == data.end() || !static_cast<ipl::BakedPathData*>(entry->second.get())->complete()) return 0;
++        target->addData(id, std::move(entry->second));
++        data.erase(entry);
++        return 1;
++    } catch (...) { return 0; }
++}
++
++IPLAPI const char* SA_PATHCALL saPathCacheError()
++{
++    static thread_local std::string error;
++    error = ipl::PathBaker::fileCacheError();
++    return error.c_str();
++}
++}
+diff --git a/core/src/core/path_data.cpp b/core/src/core/path_data.cpp
+index cbc0af6..b637a39 100644
+--- a/core/src/core/path_data.cpp
++++ b/core/src/core/path_data.cpp
+@@ -1,4 +1,4 @@
+-//
++// Modified for gmod-steamaudio: streamed baking and paged path lookup, 2026.
+ // Copyright 2017-2023 Valve Corporation.
+ //
+ // Licensed under the Apache License, Version 2.0 (the "License");
+@@ -17,9 +17,42 @@
+ #include "path_data.h"
+ 
+ #include "profiler.h"
++#include "error.h"
++#include <mutex>
+ 
+ namespace ipl {
+ 
++namespace {
++std::mutex fileCacheMutex;
++PathBaker::FileCacheSettings fileSettings;
++std::string fileError;
++}
++
++void PathBaker::configureFileCache(const FileCacheSettings& settings)
++{
++    std::lock_guard<std::mutex> lock(fileCacheMutex);
++    fileSettings = settings;
++    fileError.clear();
++}
++
++PathBaker::FileCacheSettings PathBaker::fileCacheSettings()
++{
++    std::lock_guard<std::mutex> lock(fileCacheMutex);
++    return fileSettings;
++}
++
++void PathBaker::setFileCacheError(const std::string& error)
++{
++    std::lock_guard<std::mutex> lock(fileCacheMutex);
++    fileError = error;
++}
++
++std::string PathBaker::fileCacheError()
++{
++    std::lock_guard<std::mutex> lock(fileCacheMutex);
++    return fileError;
++}
++
+ // --------------------------------------------------------------------------------------------------------------------
+ // SoundPath
+ // --------------------------------------------------------------------------------------------------------------------
+@@ -208,8 +241,13 @@ BakedPathData::BakedPathData(const IScene& scene,
+                              std::atomic<bool>& cancel,
+                              ProgressCallback progressCallback,
+                              void* callbackUserData)
+-    : mBakedPathRefs(probes.numProbes(), probes.numProbes())
++    : mNumProbes(probes.numProbes())
++    , mNeedsUpdate(false)
+ {
++    if (!PathBaker::fileCacheSettings().output.empty())
++        mFilePaths.reset(new sa::PathCacheFile);
++    else
++        mBakedPathRefs.resize(probes.numProbes(), probes.numProbes());
+     // First, generate the visibility graph.
+     ProbeVisibilityTester visTester(numSamples, asymmetricVisRange, down);
+ 
+@@ -217,7 +255,14 @@ BakedPathData::BakedPathData(const IScene& scene,
+     mVisGraph = ipl::make_unique<ProbeVisibilityGraph>(scene, probes, visTester, radius, threshold, visRange,
+                                                        numThreads, jobGraph, cancel, progressCallback, callbackUserData);
+ 
+-    threadPool.process(jobGraph, [progressCallback, callbackUserData](float percentComplete) { progressCallback(percentComplete, callbackUserData); });
++    threadPool.process(jobGraph, [progressCallback, callbackUserData](float percentComplete) { if (progressCallback) progressCallback(percentComplete, callbackUserData); });
++
++    if (mFilePaths)
++    {
++        if (!cancel)
++            bakeFilePaths(scene, probes, pathRange, numThreads, threadPool, cancel, progressCallback, callbackUserData);
++        return;
++    }
+ 
+     // Next, using multiple threads, calculate shortest paths between every pair of probes.
+     PathFinder pathFinder(probes, numThreads);
+@@ -246,7 +291,7 @@ BakedPathData::BakedPathData(const IScene& scene,
+         });
+     }
+ 
+-    threadPool.process(jobGraph, [progressCallback, callbackUserData](float percentComplete) { progressCallback(percentComplete, callbackUserData); });
++    threadPool.process(jobGraph, [progressCallback, callbackUserData](float percentComplete) { if (progressCallback) progressCallback(percentComplete, callbackUserData); });
+ 
+     // Remove all data with j > i, since they can be reconstructed from the data with j < i due to symmetry.
+     ProbePath invalidProbePath;
+@@ -368,8 +413,117 @@ BakedPathData::BakedPathData(const IScene& scene,
+     }
+ }
+ 
++void BakedPathData::bakeFilePaths(const IScene& scene, const ProbeBatch& probes, float pathRange, int numThreads,
++                                  ThreadPool& threadPool, std::atomic<bool>& cancel,
++                                  ProgressCallback callback, void* userData)
++{
++    const auto settings = PathBaker::fileCacheSettings();
++    const auto slash = settings.output.find_last_of("/\\");
++    mFileBase = settings.output.substr(slash == std::string::npos ? 0 : slash + 1);
++    mFileKey = settings.key;
++    std::string error;
++    if (!mFilePaths->Begin(settings.output, probes.numProbes(), settings.key, settings.cacheBytes, error))
++    {
++        PathBaker::setFileCacheError(error);
++        return;
++    }
++    PathFinder finder(probes, numThreads);
++    std::vector<ProbePath> paths(numThreads);
++    std::vector<std::vector<sa::PathCacheRecord>> records(numThreads);
++    for (int i = 0; i < numThreads; ++i)
++    {
++        paths[i].nodes.reserve(probes.numProbes());
++        records[i].reserve(probes.numProbes());
++    }
++    std::atomic<bool> failed(false);
++    JobGraph jobs;
++    for (int row = 0; row < probes.numProbes(); ++row)
++    {
++        jobs.addJob([&, row](int threadIndex, std::atomic<bool>&)
++        {
++            if (cancel || failed || mFilePaths->HasRow(row))
++                return;
++            try
++            {
++                finder.buildShortestPathTree(probes, *mVisGraph, row, pathRange, threadIndex);
++                auto& output = records[threadIndex];
++                output.clear();
++                for (int target = 0; target < row && !cancel && !failed; ++target)
++                {
++                    auto& path = paths[threadIndex];
++                    finder.buildProbePath(row, target, threadIndex, path);
++                    if (!path.valid)
++                        continue;
++                    SoundPath soundPath(path, probes);
++                    sa::PathCacheRecord record;
++                    record.target = static_cast<uint16_t>(target);
++                    record.first = soundPath.firstProbe;
++                    record.last = soundPath.lastProbe;
++                    record.afterFirst = soundPath.probeAfterFirst;
++                    record.beforeLast = soundPath.probeBeforeLast;
++                    record.flags = soundPath.direct ? 1 : 0;
++                    record.distance = soundPath.distanceInternal;
++                    record.deviation = soundPath.deviationInternal;
++                    output.push_back(record);
++                }
++                std::string writeError;
++                if (!cancel && !failed && !mFilePaths->WriteRow(row, output, writeError))
++                {
++                    failed = true;
++                    PathBaker::setFileCacheError(writeError);
++                }
++            }
++            catch (const std::exception& failure)
++            {
++                failed = true;
++                PathBaker::setFileCacheError(failure.what());
++            }
++        });
++    }
++    threadPool.process(jobs, [callback, userData](float progress) { if (callback) callback(progress, userData); });
++    if (!cancel && !failed && !mFilePaths->Finish(error))
++        PathBaker::setFileCacheError(error);
++}
++
++sa::PathCacheFileStats BakedPathData::fileCacheStats() const
++{
++    sa::PathCacheFileStats stats;
++    if (mFilePaths)
++        stats = mFilePaths->Stats();
++    else
++        stats.residentBytes = mBakedPathRefs.totalSize() * sizeof(SoundPathRef) + mUniqueBakedPaths.totalSize() * sizeof(SoundPath);
++    if (mVisGraph)
++        for (const auto& row : mVisGraph->mAdjacent)
++            stats.residentBytes += row.capacity() * sizeof(ProbeVisibilityGraph::AdjacencyListEntry);
++    stats.probes = mNumProbes;
++    return stats;
++}
++
+ BakedPathData::BakedPathData(const Serialized::BakedPathingData* serializedObject)
++    : mNeedsUpdate(false)
+ {
++    if (serializedObject && serializedObject->external_file())
++    {
++        const auto settings = PathBaker::fileCacheSettings();
++        mFileBase = serializedObject->external_file()->str();
++        mFileKey = serializedObject->external_key();
++        if (settings.directory.empty() || mFileBase.empty() || mFileBase == "." || mFileBase == ".." ||
++            mFileBase.find_first_of("/\\:") != std::string::npos ||
++            !serializedObject->vis_graph() || !serializedObject->vis_graph()->nodes())
++            throw Exception(Status::Failure);
++        mNumProbes = static_cast<int>(serializedObject->vis_graph()->nodes()->Length());
++        if (mNumProbes <= 0 || mNumProbes > 32768)
++            throw Exception(Status::Failure);
++        mVisGraph = ipl::make_unique<ProbeVisibilityGraph>(serializedObject->vis_graph());
++        mFilePaths.reset(new sa::PathCacheFile);
++        std::string error;
++        if (!mFilePaths->Open(settings.directory + "/" + mFileBase, mNumProbes, mFileKey, settings.cacheBytes, error))
++        {
++            PathBaker::setFileCacheError(error);
++            throw Exception(Status::Failure);
++        }
++        return;
++    }
+     assert(serializedObject);
+     assert(serializedObject->vis_graph() && serializedObject->vis_graph()->nodes() && serializedObject->vis_graph()->nodes()->Length() > 0);
+     assert(serializedObject->unique_paths() && serializedObject->unique_paths()->Length() > 0);
+@@ -378,6 +532,7 @@ BakedPathData::BakedPathData(const Serialized::BakedPathingData* serializedObjec
+ 
+     // # probes
+     auto numProbes = serializedObject->vis_graph()->nodes()->Length();
++    mNumProbes = static_cast<int>(numProbes);
+ 
+     // vis graph
+     mVisGraph = ipl::make_unique<ProbeVisibilityGraph>(serializedObject->vis_graph());
+@@ -427,6 +582,32 @@ SoundPath BakedPathData::lookupShortestPath(int start,
+     PROFILE_FUNCTION();
+ 
+     SoundPath soundPath;
++    if (start < 0 || end < 0 || start >= mNumProbes || end >= mNumProbes)
++        return soundPath;
++    if (mFilePaths)
++    {
++        sa::PathCacheRecord record;
++        std::string error;
++        if (!mFilePaths->Lookup(std::max(start, end), std::min(start, end), record, error))
++        {
++            if (!error.empty()) PathBaker::setFileCacheError(error);
++            return soundPath;
++        }
++        soundPath.firstProbe = record.first;
++        soundPath.lastProbe = record.last;
++        soundPath.probeAfterFirst = record.afterFirst;
++        soundPath.probeBeforeLast = record.beforeLast;
++        soundPath.direct = record.flags != 0;
++        soundPath.distanceInternal = record.distance;
++        soundPath.deviationInternal = record.deviation;
++        if (start < end)
++        {
++            std::swap(soundPath.firstProbe, soundPath.lastProbe);
++            std::swap(soundPath.probeAfterFirst, soundPath.probeBeforeLast);
++        }
++        if (probePath) reconstructProbePath(start, end, soundPath, *probePath);
++        return soundPath;
++    }
+ 
+     if (start < end)
+     {
+@@ -463,9 +644,15 @@ void BakedPathData::reconstructProbePath(int start,
+ 
+         auto current = end;
+         auto prev = (soundPath.direct) ? start : soundPath.lastProbe;
++        int remaining = mNumProbes;
+ 
+         while (current != start)
+         {
++            if (--remaining < 0 || prev < 0 || prev >= mNumProbes)
++            {
++                probePath.reset();
++                return;
++            }
+             if (current != start && current != end)
+             {
+                 probePath.nodes.push_back(current);
+@@ -491,6 +678,8 @@ void BakedPathData::reconstructProbePath(int start,
+ 
+ uint64_t BakedPathData::serializedSize() const
+ {
++    if (mFilePaths)
++        return complete() ? mVisGraph->serializedSize() + mFileBase.size() + 64 : 0;
+     // # probes
+     uint64_t size = sizeof(int32_t);
+ 
+@@ -527,6 +716,12 @@ flatbuffers::Offset<Serialized::BakedPathingData> BakedPathData::serialize(Seria
+     auto& fbb = serializedObject.fbb();
+ 
+     auto visGraphOffset = mVisGraph->serialize(serializedObject);
++    if (mFilePaths)
++    {
++        if (!complete()) throw Exception(Status::Failure);
++        const auto external = fbb.CreateString(mFileBase);
++        return Serialized::CreateBakedPathingData(fbb, visGraphOffset, 0, 0, 0, external, mFileKey);
++    }
+ 
+     vector<flatbuffers::Offset<Serialized::SoundPath>> soundPathOffsets(mUniqueBakedPaths.totalSize());
+     for (auto i = 0u; i < mUniqueBakedPaths.totalSize(); ++i)
+@@ -623,10 +818,12 @@ void PathBaker::bake(const IScene& scene,
+         probes.removeData(identifier);
+     }
+ 
+-    probes.addData(identifier, ipl::make_unique<BakedPathData>(scene, probes, numSamples, radius, threshold, visRange,
+-                                                          visRangeRealTime, pathRange, asymmetricVisRange, down,
+-                                                          pruneVisGraph, numThreads, threadPool, sCancel, progressCallback,
+-                                                          callbackUserData));
++    auto data = ipl::make_unique<BakedPathData>(scene, probes, numSamples, radius, threshold, visRange,
++                                               visRangeRealTime, pathRange, asymmetricVisRange, down,
++                                               pruneVisGraph, numThreads, threadPool, sCancel, progressCallback,
++                                               callbackUserData);
++    if (data->complete())
++        probes.addData(identifier, std::move(data));
+ 
+     sThreadPool = nullptr;
+     sBakeInProgress = false;
+diff --git a/core/src/core/path_data.fbs b/core/src/core/path_data.fbs
+index 9f5fe74..234259a 100644
+--- a/core/src/core/path_data.fbs
++++ b/core/src/core/path_data.fbs
+@@ -1,4 +1,4 @@
+-//
++// Modified for gmod-steamaudio: external path-cache references, 2026.
+ // Copyright 2017-2023 Valve Corporation.
+ //
+ // Licensed under the Apache License, Version 2.0 (the "License");
+@@ -33,4 +33,6 @@ table BakedPathingData {
+ 	unique_paths:[SoundPath];
+ 	path_indices:[int32];
+ 	paths:[int32];
++	external_file:string;
++	external_key:uint64;
+ }
+diff --git a/core/src/core/path_data.h b/core/src/core/path_data.h
+index dc2e9da..3b2ecc3 100644
+--- a/core/src/core/path_data.h
++++ b/core/src/core/path_data.h
+@@ -1,4 +1,4 @@
+-//
++// Modified for gmod-steamaudio: file-backed path data, 2026.
+ // Copyright 2017-2023 Valve Corporation.
+ //
+ // Licensed under the Apache License, Version 2.0 (the "License");
+@@ -21,6 +21,9 @@
+ #include "probe_data.h"
+ 
+ #include "path_data.fbs.h"
++#include "steamaudio/PathCacheApi.h"
++#include <string>
++#include <memory>
+ 
+ namespace ipl {
+ 
+@@ -186,8 +189,17 @@ public:
+     flatbuffers::Offset<Serialized::BakedPathingData> serialize(SerializedObject& serializedObject) const;
+ 
+     void updateVisGraphCosts(const ProbeBatch& probeBatch);
++    sa::PathCacheFileStats fileCacheStats() const;
++    bool complete() const { return !mFilePaths || mFilePaths->Stats().complete; }
+ 
+ private:
++    std::unique_ptr<sa::PathCacheFile> mFilePaths;
++    std::string mFileBase;
++    uint64_t mFileKey = 0;
++    int mNumProbes = 0;
++    void bakeFilePaths(const IScene& scene, const ProbeBatch& probes, float pathRange, int numThreads,
++                       ThreadPool& threadPool, std::atomic<bool>& cancel,
++                       ProgressCallback callback, void* userData);
+     unique_ptr<ProbeVisibilityGraph> mVisGraph; // The visibility graph.
+     Array<SoundPath> mUniqueBakedPaths; // The unique SoundPaths.
+     Array<SoundPathRef, 2> mBakedPathRefs; // SoundPathRefs for SoundPaths between every pair of probes.
+@@ -207,6 +219,16 @@ private:
+ class PathBaker
+ {
+ public:
++    struct FileCacheSettings {
++        std::string directory;
++        std::string output;
++        uint64_t key = 0;
++        uint64_t cacheBytes = 64ull * 1024 * 1024;
++    };
++    static void configureFileCache(const FileCacheSettings& settings);
++    static FileCacheSettings fileCacheSettings();
++    static void setFileCacheError(const std::string& error);
++    static std::string fileCacheError();
+     static void bake(const IScene& scene,
+                      const BakedDataIdentifier& identifier,
+                      int numSamples,
+diff --git a/core/src/core/path_finder.cpp b/core/src/core/path_finder.cpp
+index 48717c9..020ead5 100644
+--- a/core/src/core/path_finder.cpp
++++ b/core/src/core/path_finder.cpp
+@@ -1,4 +1,4 @@
+-//
++// Modified for gmod-steamaudio: incremental reconstruction from shortest-path trees, 2026.
+ // Copyright 2017-2023 Valve Corporation.
+ //
+ // Licensed under the Apache License, Version 2.0 (the "License");
+@@ -40,15 +40,9 @@ PathFinder::PathFinder(const ProbeBatch& probes,
+ }
+ 
+ // Uses Dijkstra's algorithm to find the minimum spanning tree rooted at the start node.
+-void PathFinder::findAllShortestPaths(const IScene& scene,
+-                                      const ProbeBatch& probes,
+-                                      const ProbeVisibilityGraph& visGraph,
+-                                      int start,
+-                                      float radius,
+-                                      float threshold,
+-                                      float pathRange,
+-                                      int threadIndex,
+-                                      ProbePath* paths) const
++void PathFinder::buildShortestPathTree(const ProbeBatch& probes,
++                                        const ProbeVisibilityGraph& visGraph,
++                                        int start, float pathRange, int threadIndex) const
+ {
+     PROFILE_FUNCTION();
+ 
+@@ -91,29 +85,38 @@ void PathFinder::findAllShortestPaths(const IScene& scene,
+         }
+     }
+ 
+-    for (auto i = 0; i < probes.numProbes(); ++i)
+-    {
+-        paths[i].start = start;
+-        paths[i].end = i;
+-
+-        if (mParents[threadIndex][i] >= 0)
+-        {
+-            paths[i].valid = true;
+-
+-            auto parentIndex = mParents[threadIndex][i];
+-            while (parentIndex >= 0 && parentIndex != start)
+-            {
+-                paths[i].nodes.push_back(parentIndex);
+-                parentIndex = mParents[threadIndex][parentIndex];
+-            }
++}
+ 
+-            std::reverse(paths[i].nodes.begin(), paths[i].nodes.end());
+-        }
+-        else
+-        {
+-            paths[i].valid = false;
+-        }
++void PathFinder::buildProbePath(int start, int end, int threadIndex, ProbePath& path) const
++{
++    path.reset();
++    path.start = start;
++    path.end = end;
++    auto parent = mParents[threadIndex][end];
++    if (parent < 0)
++        return;
++    path.valid = true;
++    int steps = 0;
++    while (parent >= 0 && parent != start && steps++ < mParents.size(1))
++    {
++        path.nodes.push_back(parent);
++        parent = mParents[threadIndex][parent];
+     }
++    if (parent != start)
++    {
++        path.reset();
++        return;
++    }
++    std::reverse(path.nodes.begin(), path.nodes.end());
++}
++
++void PathFinder::findAllShortestPaths(const IScene& scene, const ProbeBatch& probes,
++                                      const ProbeVisibilityGraph& visGraph, int start, float radius,
++                                      float threshold, float pathRange, int threadIndex, ProbePath* paths) const
++{
++    buildShortestPathTree(probes, visGraph, start, pathRange, threadIndex);
++    for (int i = 0; i < probes.numProbes(); ++i)
++        buildProbePath(start, i, threadIndex, paths[i]);
+ }
+ 
+ // Uses A* to speed up processing.
+diff --git a/core/src/core/path_finder.h b/core/src/core/path_finder.h
+index d459ea5..1219dec 100644
+--- a/core/src/core/path_finder.h
++++ b/core/src/core/path_finder.h
+@@ -1,4 +1,4 @@
+-//
++// Modified for gmod-steamaudio: incremental path-tree API, 2026.
+ // Copyright 2017-2023 Valve Corporation.
+ //
+ // Licensed under the Apache License, Version 2.0 (the "License");
+@@ -83,6 +83,10 @@ public:
+                               int threadIndex,
+                               ProbePath* paths) const;
+ 
++    void buildShortestPathTree(const ProbeBatch& probes, const ProbeVisibilityGraph& visGraph,
++                               int start, float pathRange, int threadIndex) const;
++    void buildProbePath(int start, int end, int threadIndex, ProbePath& path) const;
++
+     // Finds the shortest path from the start probe to the end probe. Intended for use when recalculating paths
+     // on the fly.
+     ProbePath findShortestPath(const IScene& scene,
+diff --git a/core/src/core/path_simulator.cpp b/core/src/core/path_simulator.cpp
+index 11a0074..14ae140 100644
+--- a/core/src/core/path_simulator.cpp
++++ b/core/src/core/path_simulator.cpp
+@@ -1,4 +1,4 @@
+-//
++// Modified for gmod-steamaudio: bound path-validation traversal, 2026.
+ // Copyright 2017-2023 Valve Corporation.
+ //
+ // Licensed under the Apache License, Version 2.0 (the "License");
+@@ -62,9 +62,12 @@ bool PathSimulator::isPathOccluded(const SoundPath& path,
+ 
+         auto current = end;
+         auto prev = (path.direct) ? start : path.lastProbe;
++        int remaining = probes.numProbes();
+ 
+         while (current != start)
+         {
++            if (--remaining < 0 || current < 0 || current >= probes.numProbes() || prev < 0 || prev >= probes.numProbes())
++                return true;
+             bool probeVisible = enableValidation ? mVisTester.areProbesVisible(scene, probes, current, prev, radius, threshold) : true;
+             if (!probeVisible)
+             {
