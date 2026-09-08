@@ -52,7 +52,7 @@ jobs:
           path: |
             third_party/steamaudio/source/core/deps
             third_party/steamaudio/source/core/deps-build
-          key: sdk-v481-vs2022-x64-${{ hashFiles('third_party/steamaudio/source/core/build/dependencies.json', 'third_party/steamaudio/source/core/build/get_dependencies.py') }}
+          key: sdk-v481-vs2022-x64-crtmt-v2-${{ hashFiles('third_party/steamaudio/source/core/build/dependencies.json', 'third_party/steamaudio/source/core/build/get_dependencies.py') }}
       - name: Build resource-limited launcher
         shell: pwsh
         run: |
@@ -65,9 +65,20 @@ jobs:
         run: |
           $python = (Get-Command python).Source
           $work = "$env:GITHUB_WORKSPACE/third_party/steamaudio/source/core/build"
+          $crtProjects = @{
+            pffft = 'pffft/build/windows-x64/PFFFT.vcxproj'
+            mysofa = 'mysofa/build/windows-x64/src/mysofa-static.vcxproj'
+          }
           foreach ($dependency in @('flatbuffers','pffft','zlib','mysofa','ispc','embree','opencl','radeonrays')) {
             & host-tools/Release/sa_run_limited.exe --memory-mb 6144 --cpu-percent 90 --workdir $work -- $python "$work/get_dependencies.py" --platform windows --architecture x64 --toolchain vs2022 --extra --dependency $dependency
             if ($LASTEXITCODE -ne 0) { throw "Dependency failed: $dependency" }
+            if ($crtProjects.ContainsKey($dependency)) {
+              [xml]$project = Get-Content -Raw "$work/../deps-build/$($crtProjects[$dependency])"
+              $runtimes = $project.SelectNodes("//*[local-name()='RuntimeLibrary']")
+              $invalid = @($runtimes | Where-Object { $_.InnerText -notin @('MultiThreaded','MultiThreadedDebug') })
+              if ($runtimes.Count -eq 0 -or $invalid.Count -ne 0) { throw "$dependency is not configured for static MSVC CRT" }
+              Write-Host "$dependency CRT verified: /MT (/MTd in Debug)"
+            }
           }
       - name: Build patched SDK
         shell: pwsh

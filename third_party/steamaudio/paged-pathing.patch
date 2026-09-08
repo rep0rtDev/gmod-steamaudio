@@ -24,10 +24,42 @@ index 5f9bb6a..8f4334b 100644
      find_package(TrueAudioNext)
      if (NOT TrueAudioNext_FOUND)
 diff --git a/core/build/dependencies.json b/core/build/dependencies.json
-index 89a3a70..5254489 100644
+index 89a3a70..741f34d 100644
 --- a/core/build/dependencies.json
 +++ b/core/build/dependencies.json
-@@ -423,6 +423,7 @@
+@@ -77,6 +77,7 @@
+         ]
+     },
+     "pffft": {
++        "gmod_modification_notice": "Modified for gmod-steamaudio: honor MSVC runtime selection via CMP0091, 2026",
+         "type": "required",
+         "check": {
+             "headers": ["pffft.h"],
+@@ -90,6 +91,7 @@
+             "cmake": [
+                 {
+                     "flags": [
++                        "-DCMAKE_POLICY_DEFAULT_CMP0091=NEW",
+                         "-DPFFFT_USE_TYPE_DOUBLE=OFF",
+                         "-DPFFFT_USE_FFTPACK=OFF",
+                         "-DPFFFT_USE_BENCH_GREEN=OFF",
+@@ -243,6 +245,7 @@
+         ]
+     },
+     "mysofa": {
++        "gmod_modification_notice": "Modified for gmod-steamaudio: honor MSVC runtime selection via CMP0091, 2026",
+         "type": "required",
+         "check": {
+             "headers": ["mysofa.h"],
+@@ -257,6 +260,7 @@
+             "cmake": [
+                 {
+                     "flags": [
++                        "-DCMAKE_POLICY_DEFAULT_CMP0091=NEW",
+                         "-DBUILD_SHARED_LIBS=FALSE",
+                         "-DBUILD_TESTS=FALSE"
+                     ]
+@@ -423,6 +427,7 @@
          ]
      },
      "radeonrays": {
@@ -35,7 +67,7 @@ index 89a3a70..5254489 100644
          "type": "extra",
          "platforms": ["windows-x64"],
          "check": {
-@@ -460,7 +461,7 @@
+@@ -460,7 +465,7 @@
              "custom": {
                  "working_directory": "$src/radeonrays",
                  "commands": [
