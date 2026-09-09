@@ -15,8 +15,8 @@
 //     sources within the simulator's source budget.
 //
 // Thread-safety:
-//   game thread  -> sim thread : SpscQueue<Command> (never blocks; payloads are
-//                                shared_ptr so large meshes are moved, not copied)
+//   game thread  -> sim thread : bounded SpscQueue<Command> with a short wake mutex
+//                                (shared_ptr payloads move large meshes without copying)
 //   any thread   -> sim thread : SeqLock<RuntimeConfig>, SeqLock<ListenerState>
 //   sim thread   -> audio      : retained IPLSource published in SoundSource
 //   sim thread   -> game       : ReleaseQueue for retired stream sources, atomics for stats
@@ -175,6 +175,7 @@ private:
 
     void Run();
     void Tick();
+    bool QueueCommand(Command&& cmd);
     void DrainCommands();
     void HandleCommand(Command& cmd);
     void ApplyMapGeometry(const BspGeometry& geometry);

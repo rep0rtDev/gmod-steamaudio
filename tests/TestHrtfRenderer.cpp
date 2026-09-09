@@ -445,7 +445,9 @@ SA_TEST(SimulationThread_PrimesNewCaptureWithoutWaitingForPeriodicTick)
     SA_CHECK_EQ(runs, before + 1);
 }
 
-SA_TEST(SimulationThread_DeferredGeometryCommitWakesBeforePeriodicTick)
+namespace {
+
+void CheckDeferredGeometryCommit(bool brushModel)
 {
     const char* dir = PhononDir();
     if (!dir) throw satest::Skipped{"SA_PHONON_DIR not set"};
@@ -474,20 +476,53 @@ SA_TEST(SimulationThread_DeferredGeometryCommitWakesBeforePeriodicTick)
     setup.simulator = &simulator;
     setup.scene = &scene;
     SA_CHECK(worker.Start(setup));
-    const auto id = worker.AllocDynamicId();
-    SA_CHECK(worker.AddDynamicGeometry(id, std::make_shared<MeshData>(fixture.door), Transform{}, "door"));
+    const DynamicGeometryId id = brushModel ? 1u : worker.AllocDynamicId();
+    if (brushModel) {
+        auto geometry = std::make_shared<BspGeometry>();
+        geometry->world = fixture.walls;
+        geometry->mapName = "commit_cadence";
+        BspBrushModel brush;
+        brush.modelIndex = 1;
+        brush.classname = "func_door";
+        brush.mesh = fixture.door;
+        geometry->brushModels.push_back(std::move(brush));
+        SA_CHECK(worker.SetMapGeometry(geometry, geometry->mapName));
+    } else {
+        SA_CHECK(worker.AddDynamicGeometry(id, std::make_shared<MeshData>(fixture.door), Transform{}, "door"));
+    }
     const auto firstDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (worker.Stats().sceneCommits.load() == 0 && std::chrono::steady_clock::now() < firstDeadline)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     SA_CHECK(worker.Stats().sceneCommits.load() > 0);
-    const uint64_t before = worker.Stats().sceneCommits.load();
-    SA_CHECK(worker.UpdateDynamicGeometry(id, Transform::FromAngles({128.f, 0.f, 0.f}, {})));
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (worker.Stats().sceneCommits.load() == before && std::chrono::steady_clock::now() < deadline)
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    const bool committed = worker.Stats().sceneCommits.load() > before;
+    for (int update = 1; update <= 4; ++update) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        const uint64_t before = worker.Stats().sceneCommits.load();
+        const Vec3 origin{128.f * static_cast<float>(update), 0.f, 0.f};
+        const bool queued = brushModel ? worker.UpdateBrushModel(1, origin, {})
+                                       : worker.UpdateDynamicGeometry(id, Transform::FromAngles(origin, {}));
+        SA_CHECK(queued);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (worker.Stats().sceneCommits.load() == before && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        const uint64_t after = worker.Stats().sceneCommits.load();
+        if (after == before)
+            std::printf("    %s update %d was queued but no geometry commit occurred\n",
+                        brushModel ? "brush" : "dynamic", update);
+        SA_CHECK_EQ(after, before + 1);
+    }
     worker.Stop();
-    SA_CHECK(committed);
+}
+
+}
+
+SA_TEST(SimulationThread_DeferredGeometryCommitWakesBeforePeriodicTick)
+{
+    CheckDeferredGeometryCommit(false);
+}
+
+SA_TEST(SimulationThread_DeferredBrushCommitWakesBeforePeriodicTick)
+{
+    CheckDeferredGeometryCommit(true);
 }
 
 SA_TEST(SimulationThread_PublishesDirectBeforeSlowReflections)

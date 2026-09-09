@@ -105,11 +105,7 @@ bool SimulationThread::AddStreamSource(const SoundSourcePtr& source)
     cmd.type = Command::Type::AddSource;
     cmd.source = source;
     cmd.id = source->Id();
-    if (!m_commands.TryPush(std::move(cmd)))
-        return false;
-    m_pendingCommands.fetch_add(1, std::memory_order_release);
-    m_wake.notify_one();
-    return true;
+    return QueueCommand(std::move(cmd));
 }
 
 bool SimulationThread::RemoveStreamSource(uint32_t id)
@@ -117,11 +113,7 @@ bool SimulationThread::RemoveStreamSource(uint32_t id)
     Command cmd;
     cmd.type = Command::Type::RemoveSource;
     cmd.id = id;
-    if (!m_commands.TryPush(std::move(cmd)))
-        return false;
-    m_pendingCommands.fetch_add(1, std::memory_order_release);
-    m_wake.notify_one();
-    return true;
+    return QueueCommand(std::move(cmd));
 }
 
 bool SimulationThread::SetMapGeometry(std::shared_ptr<const BspGeometry> geometry, const std::string& mapName)
@@ -130,11 +122,7 @@ bool SimulationThread::SetMapGeometry(std::shared_ptr<const BspGeometry> geometr
     cmd.type = Command::Type::SetMap;
     cmd.geometry = std::move(geometry);
     cmd.name = mapName;
-    if (!m_commands.TryPush(std::move(cmd)))
-        return false;
-    m_pendingCommands.fetch_add(1, std::memory_order_release);
-    m_wake.notify_one();
-    return true;
+    return QueueCommand(std::move(cmd));
 }
 
 bool SimulationThread::AddStaticGeometry(std::shared_ptr<const MeshData> mesh, const std::string& debugName)
@@ -145,11 +133,7 @@ bool SimulationThread::AddStaticGeometry(std::shared_ptr<const MeshData> mesh, c
     cmd.type = Command::Type::AddStatic;
     cmd.mesh = std::move(mesh);
     cmd.name = debugName;
-    if (!m_commands.TryPush(std::move(cmd)))
-        return false;
-    m_pendingCommands.fetch_add(1, std::memory_order_release);
-    m_wake.notify_one();
-    return true;
+    return QueueCommand(std::move(cmd));
 }
 
 DynamicGeometryId SimulationThread::AllocDynamicId()
@@ -168,11 +152,7 @@ bool SimulationThread::AddDynamicGeometry(DynamicGeometryId id, std::shared_ptr<
     cmd.mesh = std::move(localMesh);
     cmd.transform = transform;
     cmd.name = debugName;
-    if (!m_commands.TryPush(std::move(cmd)))
-        return false;
-    m_pendingCommands.fetch_add(1, std::memory_order_release);
-    m_wake.notify_one();
-    return true;
+    return QueueCommand(std::move(cmd));
 }
 
 bool SimulationThread::UpdateDynamicGeometry(DynamicGeometryId id, const Transform& transform)
@@ -181,10 +161,7 @@ bool SimulationThread::UpdateDynamicGeometry(DynamicGeometryId id, const Transfo
     cmd.type = Command::Type::UpdateDynamic;
     cmd.id = id;
     cmd.transform = transform;
-    if (!m_commands.TryPush(std::move(cmd)))
-        return false;
-    m_pendingCommands.fetch_add(1, std::memory_order_release);
-    return true; // transform updates are frequent; the periodic tick picks them up
+    return QueueCommand(std::move(cmd)); // frequent transforms wake the thread; scene commits remain rate-limited
 }
 
 bool SimulationThread::UpdateBrushModel(int32_t modelIndex, const Vec3& origin, const Vec3& angles)
@@ -196,10 +173,7 @@ bool SimulationThread::UpdateBrushModel(int32_t modelIndex, const Vec3& origin, 
     cmd.id = static_cast<DynamicGeometryId>(modelIndex);
     cmd.modelIndex = modelIndex;
     cmd.transform = Transform::FromAngles(origin, angles);
-    if (!m_commands.TryPush(std::move(cmd)))
-        return false;
-    m_pendingCommands.fetch_add(1, std::memory_order_release);
-    return true;
+    return QueueCommand(std::move(cmd));
 }
 
 bool SimulationThread::RemoveDynamicGeometry(DynamicGeometryId id)
@@ -207,22 +181,14 @@ bool SimulationThread::RemoveDynamicGeometry(DynamicGeometryId id)
     Command cmd;
     cmd.type = Command::Type::RemoveDynamic;
     cmd.id = id;
-    if (!m_commands.TryPush(std::move(cmd)))
-        return false;
-    m_pendingCommands.fetch_add(1, std::memory_order_release);
-    m_wake.notify_one();
-    return true;
+    return QueueCommand(std::move(cmd));
 }
 
 bool SimulationThread::ClearGeometry()
 {
     Command cmd;
     cmd.type = Command::Type::ClearGeometry;
-    if (!m_commands.TryPush(std::move(cmd)))
-        return false;
-    m_pendingCommands.fetch_add(1, std::memory_order_release);
-    m_wake.notify_one();
-    return true;
+    return QueueCommand(std::move(cmd));
 }
 
 bool SimulationThread::RequestBake(bool forceRebake)
@@ -230,18 +196,17 @@ bool SimulationThread::RequestBake(bool forceRebake)
     Command cmd;
     cmd.type = Command::Type::Bake;
     cmd.flag = forceRebake;
-    if (!m_commands.TryPush(std::move(cmd)))
-        return false;
-    m_pendingCommands.fetch_add(1, std::memory_order_release);
-    m_wake.notify_one();
-    return true;
+    return QueueCommand(std::move(cmd));
 }
 
 bool SimulationThread::CancelBake()
 {
     if (!Running())
         return false;
-    m_cancelBakeRequested.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(m_wakeMutex);
+        m_cancelBakeRequested.store(true, std::memory_order_release);
+    }
     if (m_setup.reflections)
         m_setup.reflections->CancelBake();
     m_wake.notify_one();
@@ -556,6 +521,20 @@ ListenerState SimulationThread::CurrentListener() const
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
+bool SimulationThread::QueueCommand(Command&& cmd)
+{
+    {
+        std::lock_guard<std::mutex> lock(m_wakeMutex);
+        m_pendingCommands.fetch_add(1, std::memory_order_release);
+        if (!m_commands.TryPush(std::move(cmd))) {
+            m_pendingCommands.fetch_sub(1, std::memory_order_release);
+            return false;
+        }
+    }
+    m_wake.notify_one();
+    return true;
+}
+
 void SimulationThread::DrainCommands()
 {
     Command cmd;
