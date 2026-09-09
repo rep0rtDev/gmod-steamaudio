@@ -611,11 +611,7 @@ void SceneBuilder::UpdateDynamic(DynamicId id, const IPLMatrix4x4& transform)
     if (it == m_dynamic.end() || !m_scene || std::memcmp(&it->second.transform, &transform, sizeof(transform)) == 0)
         return;
     it->second.transform = transform;
-    if (it->second.flattenedLocalMesh) {
-        it->second.transformDirty = true;
-    } else {
-        iplInstancedMeshUpdateTransform(it->second.instance, m_scene, transform);
-    }
+    it->second.transformDirty = true;
     m_dirty = true;
 }
 
@@ -662,10 +658,15 @@ void SceneBuilder::Commit()
         return;
     for (auto& item : m_dynamic) {
         auto& entry = item.second;
-        if (entry.flattenedLocalMesh && entry.transformDirty && !RebuildFlattenedDynamic(entry)) {
-            SA_LOGW("Could not update flattened dynamic mesh '%s'; retaining previous geometry", entry.name.c_str());
-            entry.transformDirty = false;
+        if (!entry.transformDirty)
+            continue;
+        if (entry.flattenedLocalMesh) {
+            if (!RebuildFlattenedDynamic(entry))
+                SA_LOGW("Could not update flattened dynamic mesh '%s'; retaining previous geometry", entry.name.c_str());
+        } else {
+            iplInstancedMeshUpdateTransform(entry.instance, m_scene, entry.transform);
         }
+        entry.transformDirty = false;
     }
     iplSceneCommit(m_scene);
     ReleaseRetiredMeshes();

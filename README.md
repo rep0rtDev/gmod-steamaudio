@@ -308,7 +308,9 @@ Runtime:
 | `snd_sa_dynamic_players` | 1 | other players occlude sound (hull box) |
 | `snd_sa_native_entities` | 1 | walk the client entity list natively; falls back to the Lua walk when the layout does not validate (`snd_sa_restart`) |
 | `snd_sa_dynamic_max` / `snd_sa_dynamic_range` / `snd_sa_dynamic_min_size` | 256 / 3000 / 8 | occluder count limit, listener range and minimum hull side (units); nearest entities win |
-| `snd_sa_dynamic_interval` | 100 | occluder update interval (ms) |
+| `snd_sa_dynamic_interval` | 100 | minimum interval between scan starts and transform-only scene commits (ms); topology changes commit immediately |
+| `snd_sa_dynamic_scan_budget_ms` | 2 | native entity scan budget per game frame; lower values trade discovery/refresh latency for smoother frames |
+| `snd_sa_dynamic_model_budget_ms` | 2 | soft budget for starting additional model loads in one update; one model operation can exceed it |
 | `snd_sa_static_props` | 1 | instance static prop collision models into the scene (next map load) |
 | `snd_sa_static_prop_box_fallback` | 1 | hull-box approximation for props without a usable `.phy` |
 | `snd_sa_vmt_surfaceprops` | 1 | read `$surfaceprop` from `materials/*.vmt` for world faces (next map load) |
@@ -351,6 +353,17 @@ Static (restart required):
 
 Console commands: `snd_sa_status`, `snd_sa_sounds`, `snd_sa_restart`,
 `snd_sa_bake`, `snd_sa_bake_cancel`, `snd_sa_reload_map`, `snd_sa_cvars`.
+
+`snd_sa_status` separates game-thread scanning/tracking from simulation commands
+and scene commits. Native scans resume across frames, with at most 256 slots per
+slice. Existing transforms can refresh from partial slices; removals and new
+occluder selection wait for a complete snapshot. The `entity sweep` line reports
+pending progress and the wall time of the last complete sweep, including the
+frames between slices. `model timings` separates file reads from total model
+preparation. Budgets are cooperative: an individual engine call or model load
+cannot be interrupted. Dynamic model lookup trusts a validated mounted engine
+filesystem instead of scanning unmounted addon archives for missing optional
+`.phy` files; general file/map lookup retains its fallback behavior.
 
 `snd_sa_sounds` prints the listener, every sound the engine reports active
 (guid, entity, origin, listener-relative direction, matched capture slot) and

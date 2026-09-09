@@ -14,6 +14,13 @@ namespace {
 
 constexpr size_t kMaxSnapshotEntities = 16384;
 
+uint32_t ElapsedMicros(std::chrono::steady_clock::time_point start)
+{
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    return static_cast<uint32_t>(std::min<int64_t>(elapsed, UINT32_MAX));
+}
+
 bool IsBrushModel(const std::string& model, int32_t& index)
 {
     if (model.size() < 2 || model[0] != '*')
@@ -236,6 +243,8 @@ void DynamicOccluders::Configure(const DynamicOccluderOptions& options)
     m_options = options;
     m_options.maxOccluders = std::max(0, m_options.maxOccluders);
     m_options.modelLoadsPerUpdate = std::max(1, m_options.modelLoadsPerUpdate);
+    m_options.modelLoadBudgetMs = std::isfinite(m_options.modelLoadBudgetMs)
+                                    ? std::clamp(m_options.modelLoadBudgetMs, 0.f, 8.f) : 2.f;
     m_options.missedUpdatesBeforeRemove = std::max(1, m_options.missedUpdatesBeforeRemove);
     if (unitsChanged) {
         // Cached meshes are in meters; they must be rebuilt with the new scale.
@@ -256,7 +265,13 @@ const DynamicOccluders::CachedModel* DynamicOccluders::LoadModel(const std::stri
         return &it->second;
     if (budget <= 0)
         return nullptr;
+    if (budget < m_options.modelLoadsPerUpdate && std::chrono::steady_clock::now() >= m_modelDeadline) {
+        ++m_stats.modelBudgetDeferrals;
+        return nullptr;
+    }
     --budget;
+    ++m_stats.modelLoads;
+    const auto modelStart = std::chrono::steady_clock::now();
 
     CachedModel cached;
     if (!m_reader) {
@@ -266,7 +281,14 @@ const DynamicOccluders::CachedModel* DynamicOccluders::LoadModel(const std::stri
         options.boxFallback = m_options.boxFallback;
         options.maxModelTriangles = m_options.maxModelTriangles;
         PropModelGeometry geometry;
-        if (LoadPropModelGeometry(model, m_reader, options, geometry) && geometry.valid) {
+        const GameFileReader reader = [this](const std::string& path, std::vector<uint8_t>& data, std::string& error) {
+            const auto readStart = std::chrono::steady_clock::now();
+            const bool ok = m_reader(path, data, error);
+            m_stats.lastFileReadMicros = ElapsedMicros(readStart);
+            m_stats.maxFileReadMicros = std::max(m_stats.maxFileReadMicros, m_stats.lastFileReadMicros);
+            return ok;
+        };
+        if (LoadPropModelGeometry(model, reader, options, geometry) && geometry.valid) {
             cached.mesh = BuildMesh(geometry, m_options.unitsPerMeter, m_materials);
             cached.fromCollision = geometry.fromCollision;
             cached.extent = LargestExtent(geometry);
@@ -292,6 +314,8 @@ const DynamicOccluders::CachedModel* DynamicOccluders::LoadModel(const std::stri
     if (cached.missing)
         ++m_stats.modelsMissing;
     TrimModelCache();
+    m_stats.lastModelLoadMicros = ElapsedMicros(modelStart);
+    m_stats.maxModelLoadMicros = std::max(m_stats.maxModelLoadMicros, m_stats.lastModelLoadMicros);
     return &m_models.emplace(model, std::move(cached)).first->second;
 }
 
@@ -333,6 +357,10 @@ void DynamicOccluders::Update(const std::vector<EntitySnapshot>& entities, const
                               IDynamicGeometrySink& sink)
 {
     ++m_stats.updates;
+    m_modelDeadline = m_options.modelLoadBudgetMs > 0.f
+        ? std::chrono::steady_clock::now() + std::chrono::microseconds(
+              static_cast<int64_t>(m_options.modelLoadBudgetMs * 1000.f))
+        : std::chrono::steady_clock::time_point::max();
     m_stats.skippedRange = m_stats.skippedSmall = m_stats.skippedLimit = m_stats.skippedInside = 0;
     m_stats.pendingLoads = 0;
     m_stats.brushModels = 0;
@@ -553,6 +581,50 @@ void DynamicOccluders::Update(const std::vector<EntitySnapshot>& entities, const
             it = m_brush.erase(it);
         else
             ++it;
+    }
+}
+
+void DynamicOccluders::RefreshTransforms(const std::vector<EntitySnapshot>& entities, IDynamicGeometrySink& sink)
+{
+    if (!m_options.enabled)
+        return;
+    size_t considered = 0;
+    for (const EntitySnapshot& e : entities) {
+        if (++considered > kMaxSnapshotEntities)
+            break;
+        if (e.index <= 0 || e.dormant || !Finite(e.origin) || !Finite(e.angles))
+            continue;
+        m_orientation[e.index] = e.angles;
+        if (e.index == m_localPlayer)
+            continue;
+        const std::string model = NormalizeModel(e.model);
+        int32_t brushIndex = 0;
+        if (IsBrushModel(model, brushIndex)) {
+            if (!m_options.brushModels)
+                continue;
+            BrushTracked& b = m_brush[brushIndex];
+            if ((!b.initialized || Moved(b.origin, b.angles, e.origin, e.angles)) &&
+                sink.UpdateBrushModel(brushIndex, e.origin, e.angles)) {
+                ++m_stats.brushUpdates;
+                b.initialized = true;
+                b.origin = e.origin;
+                b.angles = e.angles;
+            }
+            continue;
+        }
+        auto it = m_tracked.find(e.index);
+        if (it == m_tracked.end() || it->second.id == 0 || e.solid == kSolidNone ||
+            (e.player ? !m_options.players : !m_options.props))
+            continue;
+        TrackedEntity& t = it->second;
+        if (t.serial != e.serial || t.model != model || t.player != e.player)
+            continue;
+        if (Moved(t.origin, t.angles, e.origin, e.angles) &&
+            sink.UpdateMesh(t.id, Transform::FromAngles(e.origin, e.angles))) {
+            ++m_stats.transformUpdates;
+            t.origin = e.origin;
+            t.angles = e.angles;
+        }
     }
 }
 

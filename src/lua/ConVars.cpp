@@ -174,7 +174,11 @@ public:
         RtFloat("snd_sa_dynamic_min_size", rt.dynamicMinExtentUnits, &RuntimeConfig::dynamicMinExtentUnits,
                 "Skip entities whose largest hull side is below this (units).", 0.f, 1024.f);
         RtFloat("snd_sa_dynamic_interval", rt.dynamicUpdateIntervalMs, &RuntimeConfig::dynamicUpdateIntervalMs,
-                "Dynamic occluder update interval (ms).", 16.f, 5000.f);
+                "Minimum interval between entity scan starts (ms); pending scans continue in later frames.", 16.f, 5000.f);
+        RtFloat("snd_sa_dynamic_scan_budget_ms", rt.dynamicScanBudgetMs, &RuntimeConfig::dynamicScanBudgetMs,
+                "Native entity scan budget per game frame (ms); one engine call may overrun it.", 0.25f, 8.f);
+        RtFloat("snd_sa_dynamic_model_budget_ms", rt.dynamicModelBudgetMs, &RuntimeConfig::dynamicModelBudgetMs,
+                "Soft model preparation budget per occluder update (ms); one model operation may overrun it.", 0.25f, 8.f);
         RtBool("snd_sa_static_props", rt.staticProps, &RuntimeConfig::staticProps,
                "Add static prop collision models (.phy) to the acoustic scene (applies on next map load).");
         RtBool("snd_sa_vmt_surfaceprops", rt.vmtSurfaceProps, &RuntimeConfig::vmtSurfaceProps,

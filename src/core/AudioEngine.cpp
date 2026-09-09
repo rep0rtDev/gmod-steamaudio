@@ -240,6 +240,8 @@ void ParseRuntimeConfig(const JsonValue& v, RuntimeConfig& out)
     ReadNumber(v, "dynamic_range_units", out.dynamicRangeUnits);
     ReadNumber(v, "dynamic_min_extent_units", out.dynamicMinExtentUnits);
     ReadNumber(v, "dynamic_update_interval_ms", out.dynamicUpdateIntervalMs);
+    ReadNumber(v, "dynamic_scan_budget_ms", out.dynamicScanBudgetMs);
+    ReadNumber(v, "dynamic_model_budget_ms", out.dynamicModelBudgetMs);
     ReadBool(v, "static_props", out.staticProps);
     ReadBool(v, "static_prop_box_fallback", out.staticPropBoxFallback);
     ReadBool(v, "vmt_surfaceprops", out.vmtSurfaceProps);
@@ -466,7 +468,7 @@ bool AudioEngine::InitializeEngineSide(std::string& error)
     }
     m_occluders.SetMaterials(&m_materials);
     m_occluders.SetReader([this](const std::string& path, std::vector<uint8_t>& out, std::string& readError) {
-        return ReadGameFile(path, out, readError);
+        return ReadGameFile(path, out, readError, nullptr, false);
     });
     m_occluders.Configure(OccluderOptions());
 
@@ -1346,7 +1348,7 @@ bool AudioEngine::LoadMap(const std::string& mapName, std::string& error)
 }
 
 bool AudioEngine::ReadGameFile(const std::string& relativePath, std::vector<uint8_t>& out, std::string& error,
-                               std::string* resolvedBy)
+                               std::string* resolvedBy, bool fallbackOnEngineMiss)
 {
     out.clear();
     const std::string rel = GmaArchive::NormalizePath(relativePath);
@@ -1363,6 +1365,10 @@ bool AudioEngine::ReadGameFile(const std::string& relativePath, std::vector<uint
             return true;
         }
         detail = "engine fs: " + fsError;
+        if (!fallbackOnEngineMiss) {
+            error = detail;
+            return false;
+        }
     }
     const std::string candidates[] = {
         JoinPath(m_paths.gameDirectory, rel),
@@ -1478,6 +1484,7 @@ DynamicOccluderOptions AudioEngine::OccluderOptions() const
     o.maxOccluders = Clamp(rt.dynamicMaxOccluders, 0, 4096);
     o.rangeUnits = rt.dynamicRangeUnits;
     o.minExtentUnits = std::max(0.f, rt.dynamicMinExtentUnits);
+    o.modelLoadBudgetMs = std::isfinite(rt.dynamicModelBudgetMs) ? Clamp(rt.dynamicModelBudgetMs, 0.25f, 8.f) : 2.f;
     o.unitsPerMeter = rt.unitsPerMeter;
     return o;
 }
@@ -1542,6 +1549,7 @@ void AudioEngine::UpdateDynamicOccluders(float frameTime)
         return;
     const RuntimeConfig& rt = m_config.runtime;
     if (!rt.dynamicGeometry && !rt.dynamicProps && !rt.dynamicPlayers) {
+        m_entityList.CancelSnapshot();
         if (m_occluders.GetStats().tracked > 0) {
             SimulationGeometrySink sink(m_simulation);
             m_occluders.Clear(sink);
@@ -1550,24 +1558,29 @@ void AudioEngine::UpdateDynamicOccluders(float frameTime)
         return;
     }
 
+    const bool nativeAvailable = rt.nativeEntityList && m_entityList.GetState() != ClientEntityList::State::Failed &&
+                                 m_entityList.GetState() != ClientEntityList::State::Uninitialized;
+    if (!nativeAvailable)
+        m_entityList.CancelSnapshot();
     m_occluderTimer += frameTime;
     const float interval = Clamp(rt.dynamicUpdateIntervalMs, 16.f, 5000.f) * 0.001f;
-    if (m_occluderTimer < interval)
+    const bool continuingScan = nativeAvailable && m_entityList.SnapshotInProgress();
+    if (!continuingScan && m_occluderTimer < interval)
         return;
-    m_occluderTimer = 0.f;
+    if (!continuingScan)
+        m_occluderTimer = 0.f;
 
     Vec3 listener{};
     const bool listenerValid = ListenerPosition(listener);
     m_occluders.SetLocalPlayer(m_localPlayer);
     SimulationGeometrySink sink(m_simulation);
 
-    if (rt.nativeEntityList && m_entityList.GetState() != ClientEntityList::State::Failed &&
-        m_entityList.GetState() != ClientEntityList::State::Uninitialized) {
-        m_entityScratch.clear();
+    if (nativeAvailable) {
         const auto snapshotStart = std::chrono::steady_clock::now();
-        const bool snapshotReady = m_entityList.Snapshot(m_mapName, m_localPlayer, m_entityScratch);
+        const auto snapshot = m_entityList.PollSnapshot(m_mapName, m_localPlayer, m_entityScratch,
+                                                        rt.dynamicScanBudgetMs);
         RecordTiming(snapshotStart, m_entitySnapshotMicros, m_maxEntitySnapshotMicros);
-        if (snapshotReady) {
+        if (snapshot != ClientEntityList::SnapshotResult::Unavailable) {
             if (!m_nativeEntitiesActive) {
                 SA_LOGI("[ents] native entity walk validated (%s); Lua entity walk no longer needed",
                         m_entityList.Description().c_str());
@@ -1575,7 +1588,10 @@ void AudioEngine::UpdateDynamicOccluders(float frameTime)
             }
             m_luaBatchReady = false;
             const auto updateStart = std::chrono::steady_clock::now();
-            m_occluders.Update(m_entityScratch, listener, listenerValid, sink);
+            if (snapshot == ClientEntityList::SnapshotResult::Complete)
+                m_occluders.Update(m_entityScratch, listener, listenerValid, sink);
+            else
+                m_occluders.RefreshTransforms(m_entityList.SnapshotUpdates(), sink);
             RecordTiming(updateStart, m_occluderUpdateMicros, m_maxOccluderUpdateMicros);
             return;
         }

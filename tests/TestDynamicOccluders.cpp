@@ -1,10 +1,12 @@
 // tests/TestDynamicOccluders.cpp
 #include <map>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "PhyFixture.h"
 #include "TestFramework.h"
+#include "core/ClientEntityList.h"
 #include "core/DynamicOccluders.h"
 
 using namespace sa;
@@ -156,6 +158,98 @@ DynamicOccluderOptions Options()
 }
 
 } // namespace
+
+SA_TEST(EntitySweep_PublishesOnlyAfterAllSlices)
+{
+    EntitySnapshotSweep sweep;
+    sweep.Begin(6);
+    std::vector<int32_t> visited;
+    std::vector<EntitySnapshot> complete{Prop(99, "old", {})};
+    const auto read = [&](int32_t index, EntitySnapshot& out) {
+        visited.push_back(index);
+        if (index == 2) return EntitySnapshotSweep::ReadResult::Missing;
+        if (index == 3) return EntitySnapshotSweep::ReadResult::Fault;
+        out = Prop(index, "models/drum.mdl", {200.f, 0.f, 0.f});
+        return EntitySnapshotSweep::ReadResult::Present;
+    };
+    const auto more = [] { return true; };
+    SA_CHECK(!sweep.Advance(read, more, 2, complete));
+    SA_CHECK_EQ(sweep.NextIndex(), 3);
+    SA_CHECK_EQ(complete.front().index, 99);
+    SA_CHECK_EQ(sweep.Recent().size(), size_t(1));
+    SA_CHECK(!sweep.Advance(read, more, 2, complete));
+    SA_CHECK_EQ(sweep.Faults(), uint64_t(1));
+    SA_CHECK_EQ(complete.front().index, 99);
+    SA_CHECK(sweep.Advance(read, more, 2, complete));
+    SA_CHECK(!sweep.InProgress());
+    SA_CHECK_EQ(complete.size(), size_t(4));
+    SA_CHECK_EQ(complete[0].index, 1);
+    SA_CHECK_EQ(complete[1].index, 4);
+    SA_CHECK_EQ(complete[2].index, 5);
+    SA_CHECK_EQ(complete[3].index, 6);
+    SA_CHECK_EQ(visited.size(), size_t(6));
+}
+
+SA_TEST(EntitySweep_TimeBudgetMakesProgressAndResetDiscardsPartialData)
+{
+    EntitySnapshotSweep sweep;
+    sweep.Begin(4);
+    int reads = 0;
+    const auto read = [&](int32_t index, EntitySnapshot& out) {
+        ++reads;
+        out = Prop(index, "models/drum.mdl", {});
+        return EntitySnapshotSweep::ReadResult::Present;
+    };
+    std::vector<EntitySnapshot> complete;
+    SA_CHECK(!sweep.Advance(read, [] { return false; }, 256, complete));
+    SA_CHECK_EQ(reads, 1);
+    SA_CHECK_EQ(sweep.NextIndex(), 2);
+    SA_CHECK(complete.empty());
+    sweep.Reset();
+    SA_CHECK(!sweep.InProgress());
+    SA_CHECK(sweep.Recent().empty());
+    sweep.Begin(1);
+    SA_CHECK(sweep.Advance(read, [] { return true; }, 256, complete));
+    SA_CHECK_EQ(complete.size(), size_t(1));
+    sweep.Begin(0);
+    SA_CHECK(sweep.Advance(read, [] { return true; }, 256, complete));
+    SA_CHECK(complete.empty());
+    SA_CHECK_EQ(reads, 2);
+}
+
+SA_TEST(DynOcc_PartialRefreshMovesKnownGeometryWithoutAgingUnvisitedEntities)
+{
+    Files files;
+    files.files["models/drum.phy"] = DrumPhy();
+    DynamicOccluders occ;
+    occ.Configure(Options());
+    occ.SetReader(files.Reader());
+    FakeSink sink;
+    std::vector<EntitySnapshot> all{Prop(1, "models/drum.mdl", {200.f, 0.f, 0.f}),
+                                    Prop(2, "models/drum.mdl", {400.f, 0.f, 0.f}),
+                                    Brush(3, 4, {600.f, 0.f, 0.f})};
+    occ.Update(all, {}, true, sink);
+    const int reads = files.reads;
+    all[0].origin.x += 25.f;
+    all[2].origin.x += 50.f;
+    for (int i = 0; i < 10; ++i)
+        occ.RefreshTransforms({all[0], all[2]}, sink);
+    SA_CHECK_EQ(sink.adds, 2);
+    SA_CHECK_EQ(sink.removes, 0);
+    SA_CHECK_EQ(sink.updates, 1);
+    SA_CHECK_EQ(sink.brushUpdates, 2);
+    SA_CHECK_EQ(files.reads, reads);
+    SA_CHECK_EQ(sink.Alive(), size_t(2));
+    occ.RefreshTransforms({Prop(1, "models/other.mdl", {900.f, 0.f, 0.f}),
+                           Prop(5, "models/new.mdl", {100.f, 0.f, 0.f})}, sink);
+    SA_CHECK_EQ(sink.adds, 2);
+    SA_CHECK_EQ(sink.updates, 1);
+    SA_CHECK_EQ(files.reads, reads);
+    occ.Update({all[0], all[2]}, {}, true, sink);
+    SA_CHECK_EQ(sink.Alive(), size_t(2));
+    occ.Update({all[0], all[2]}, {}, true, sink);
+    SA_CHECK_EQ(sink.Alive(), size_t(1));
+}
 
 SA_TEST(DynOcc_BoxMeshIsClosedAndInSteamAudioSpace)
 {
@@ -463,6 +557,36 @@ SA_TEST(DynOcc_RangeAndCountBudgetsPreferNearest)
     SA_CHECK(sink.AliveNamed("ent#3") == nullptr); // ~1020, out of range
     SA_CHECK(sink.AliveNamed("ent#2") == nullptr);
     SA_CHECK_EQ(sink.Alive(), size_t(2));
+}
+
+SA_TEST(DynOcc_SlowModelDefersFurtherLoadsButKeepsCachedGeometry)
+{
+    DynamicOccluders occ;
+    auto options = Options();
+    options.modelLoadBudgetMs = 0.25f;
+    occ.Configure(options);
+    const auto phy = DrumPhy();
+    int reads = 0;
+    occ.SetReader([&](const std::string&, std::vector<uint8_t>& out, std::string&) {
+        ++reads;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        out = phy;
+        return true;
+    });
+    FakeSink sink;
+    const std::vector<EntitySnapshot> entities{Prop(1, "models/a.mdl", {100.f, 0.f, 0.f}),
+                                                Prop(2, "models/b.mdl", {200.f, 0.f, 0.f}),
+                                                Prop(3, "models/a.mdl", {300.f, 0.f, 0.f})};
+    occ.Update(entities, {}, true, sink);
+    SA_CHECK_EQ(reads, 1);
+    SA_CHECK_EQ(sink.Alive(), size_t(2));
+    SA_CHECK_EQ(occ.GetStats().pendingLoads, size_t(1));
+    SA_CHECK_EQ(occ.GetStats().modelBudgetDeferrals, uint64_t(1));
+    SA_CHECK(occ.GetStats().maxFileReadMicros > 0);
+    occ.Update(entities, {}, true, sink);
+    SA_CHECK_EQ(reads, 2);
+    SA_CHECK_EQ(sink.Alive(), size_t(3));
+    SA_CHECK_EQ(occ.GetStats().pendingLoads, size_t(0));
 }
 
 SA_TEST(DynOcc_ModelLoadBudgetDefersNewEntities)

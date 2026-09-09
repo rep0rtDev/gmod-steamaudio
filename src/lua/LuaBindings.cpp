@@ -316,6 +316,11 @@ LUA_FUNCTION(L_GetStatus)
     SetFieldNumber(LUA, "emitted", static_cast<double>(s.entityList.entitiesEmitted));
     SetFieldNumber(LUA, "read_failures", static_cast<double>(s.entityList.readFailures));
     SetFieldNumber(LUA, "highest_index", s.entityList.lastHighestIndex);
+    SetFieldNumber(LUA, "scan_slices", static_cast<double>(s.entityList.scanSlices));
+    SetFieldNumber(LUA, "last_snapshot_slices", s.entityList.lastSnapshotSlices);
+    SetFieldNumber(LUA, "last_snapshot_us", s.entityList.lastSnapshotMicros);
+    SetFieldNumber(LUA, "next_index", s.entityList.nextIndex);
+    SetFieldBool(LUA, "scan_pending", s.entityList.scanPending);
     LUA->SetField(-2, "entity_list_stats");
     LUA->CreateTable();
     SetFieldNumber(LUA, "tracked", static_cast<double>(s.occluders.tracked));
@@ -335,6 +340,12 @@ LUA_FUNCTION(L_GetStatus)
     SetFieldNumber(LUA, "removed", static_cast<double>(s.occluders.removed));
     SetFieldNumber(LUA, "transform_updates", static_cast<double>(s.occluders.transformUpdates));
     SetFieldNumber(LUA, "brush_updates", static_cast<double>(s.occluders.brushUpdates));
+    SetFieldNumber(LUA, "model_loads", static_cast<double>(s.occluders.modelLoads));
+    SetFieldNumber(LUA, "model_budget_deferrals", static_cast<double>(s.occluders.modelBudgetDeferrals));
+    SetFieldNumber(LUA, "model_load_us", s.occluders.lastModelLoadMicros);
+    SetFieldNumber(LUA, "model_load_us_max", s.occluders.maxModelLoadMicros);
+    SetFieldNumber(LUA, "file_read_us", s.occluders.lastFileReadMicros);
+    SetFieldNumber(LUA, "file_read_us_max", s.occluders.maxFileReadMicros);
     LUA->SetField(-2, "occluders");
     return 1;
 }
@@ -423,9 +434,23 @@ LUA_FUNCTION(L_StatusLines)
                   s.occluders.skippedRange, s.occluders.skippedSmall, s.occluders.skippedLimit,
                   s.occluders.skippedInside, s.entitySource.c_str());
     lines.emplace_back(buf);
+    std::snprintf(buf, sizeof(buf),
+                  "  model timings last/max us: prepare %u/%u  file read %u/%u  loads %llu pending %zu budget deferrals %llu",
+                  s.occluders.lastModelLoadMicros, s.occluders.maxModelLoadMicros,
+                  s.occluders.lastFileReadMicros, s.occluders.maxFileReadMicros,
+                  static_cast<unsigned long long>(s.occluders.modelLoads), s.occluders.pendingLoads,
+                  static_cast<unsigned long long>(s.occluders.modelBudgetDeferrals));
+    lines.emplace_back(buf);
     std::snprintf(buf, sizeof(buf), "  entity list: %s  (%llu snapshots, %llu read failures, highest index %d)",
                   s.entityListState.c_str(), static_cast<unsigned long long>(s.entityList.snapshots),
                   static_cast<unsigned long long>(s.entityList.readFailures), s.entityList.lastHighestIndex);
+    lines.emplace_back(buf);
+    std::snprintf(buf, sizeof(buf),
+                  "  entity sweep: %s next %d/%d  last complete %u slices / %.1f ms wall time  budget %.2f ms/frame",
+                  s.entityList.scanPending ? "pending" : "idle", s.entityList.nextIndex,
+                  s.entityList.lastHighestIndex, s.entityList.lastSnapshotSlices,
+                  static_cast<double>(s.entityList.lastSnapshotMicros) / 1000.0,
+                  static_cast<double>(g_engine->Runtime().dynamicScanBudgetMs));
     lines.emplace_back(buf);
     std::snprintf(buf, sizeof(buf),
                   "  environment: room preset %d (%u sends)  lowpass %.0f Hz  auto directivity: %llu  hull pushes: %llu",

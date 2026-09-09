@@ -27,9 +27,12 @@
 // Thread-safety: game thread only.
 #pragma once
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "core/DynamicOccluders.h"
@@ -80,9 +83,73 @@ struct EntityListConfig {
     void ParseSlots(const JsonValue& slotsNode);
 };
 
+class EntitySnapshotSweep {
+public:
+    enum class ReadResult { Present, Missing, Fault };
+
+    void Begin(int32_t highest)
+    {
+        Reset();
+        m_highest = std::clamp(highest, 0, 16384);
+        m_next = 1;
+        m_active = true;
+        m_pending.reserve(static_cast<size_t>(m_highest));
+    }
+    void Reset()
+    {
+        m_active = false;
+        m_next = m_highest = 0;
+        m_faults = 0;
+        m_pending.clear();
+        m_recent.clear();
+    }
+    template <class Reader, class Continue>
+    bool Advance(Reader&& read, Continue&& canContinue, size_t maxEntities, std::vector<EntitySnapshot>& out)
+    {
+        m_recent.clear();
+        if (!m_active)
+            return false;
+        size_t count = 0;
+        while (m_next <= m_highest && count < std::max(size_t(1), maxEntities) &&
+               (count == 0 || canContinue())) {
+            EntitySnapshot entity;
+            const int32_t index = m_next++;
+            const ReadResult result = read(index, entity);
+            ++count;
+            if (result == ReadResult::Fault)
+                ++m_faults;
+            if (result != ReadResult::Present)
+                continue;
+            entity.index = index;
+            m_pending.push_back(entity);
+            m_recent.push_back(std::move(entity));
+        }
+        if (m_next <= m_highest)
+            return false;
+        out.swap(m_pending);
+        m_pending.clear();
+        m_active = false;
+        return true;
+    }
+    bool InProgress() const { return m_active; }
+    int32_t NextIndex() const { return m_active ? m_next : 0; }
+    int32_t HighestIndex() const { return m_highest; }
+    uint64_t Faults() const { return m_faults; }
+    const std::vector<EntitySnapshot>& Recent() const { return m_recent; }
+
+private:
+    bool m_active = false;
+    int32_t m_next = 0;
+    int32_t m_highest = 0;
+    uint64_t m_faults = 0;
+    std::vector<EntitySnapshot> m_pending;
+    std::vector<EntitySnapshot> m_recent;
+};
+
 class ClientEntityList {
 public:
     enum class State { Uninitialized, Unvalidated, Validated, Failed };
+    enum class SnapshotResult { Unavailable, Pending, Complete };
 
     // Resolves the interfaces. Does not touch any entity yet: validation
     // needs a loaded map and happens on the first Snapshot() call.
@@ -101,6 +168,11 @@ public:
     // validated (validation is attempted when `mapName` is non-empty and
     // `localPlayer` > 0). `mapName` is the bare map name ("gm_construct").
     bool Snapshot(const std::string& mapName, int32_t localPlayer, std::vector<EntitySnapshot>& out);
+    SnapshotResult PollSnapshot(const std::string& mapName, int32_t localPlayer,
+                                std::vector<EntitySnapshot>& out, float budgetMs);
+    bool SnapshotInProgress() const { return m_sweep.InProgress(); }
+    const std::vector<EntitySnapshot>& SnapshotUpdates() const { return m_sweep.Recent(); }
+    void CancelSnapshot();
 
     struct Stats {
         uint64_t snapshots = 0;
@@ -108,6 +180,11 @@ public:
         uint64_t entitiesEmitted = 0;
         uint64_t readFailures = 0; // guarded reads that faulted/returned garbage
         int32_t lastHighestIndex = 0;
+        uint64_t scanSlices = 0;
+        uint32_t lastSnapshotSlices = 0;
+        uint32_t lastSnapshotMicros = 0;
+        int32_t nextIndex = 0;
+        bool scanPending = false;
     };
     const Stats& GetStats() const { return m_stats; }
 
@@ -125,6 +202,10 @@ private:
     std::optional<ModuleImage> m_engine;
     Stats m_stats;
     bool m_loggedFailure = false;
+    EntitySnapshotSweep m_sweep;
+    std::string m_snapshotMap;
+    std::chrono::steady_clock::time_point m_snapshotStart{};
+    uint32_t m_snapshotSlices = 0;
 };
 
 } // namespace sa

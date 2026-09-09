@@ -134,6 +134,8 @@ struct RuntimeConfig {
     float dynamicRangeUnits = 3000.f; // only entities within this distance of the listener (0 = all)
     float dynamicMinExtentUnits = 8.f;
     float dynamicUpdateIntervalMs = 100.f;
+    float dynamicScanBudgetMs = 2.f;
+    float dynamicModelBudgetMs = 2.f;
     bool staticProps = true;          // instance static prop collision (.phy) / hull boxes into the scene
     bool staticPropBoxFallback = true; // approximate props without a usable .phy by their .mdl hull box
     bool vmtSurfaceProps = true;      // read $surfaceprop from materials/*.vmt for world faces

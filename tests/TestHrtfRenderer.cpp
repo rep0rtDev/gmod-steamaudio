@@ -445,6 +445,51 @@ SA_TEST(SimulationThread_PrimesNewCaptureWithoutWaitingForPeriodicTick)
     SA_CHECK_EQ(runs, before + 1);
 }
 
+SA_TEST(SimulationThread_DeferredGeometryCommitWakesBeforePeriodicTick)
+{
+    const char* dir = PhononDir();
+    if (!dir) throw satest::Skipped{"SA_PHONON_DIR not set"};
+    StaticConfig fixed;
+    fixed.maxSources = 2;
+    fixed.maxIrDuration = 0.25f;
+    fixed.simulationThreads = 1;
+    PhononContext context;
+    std::string error;
+    SA_CHECK(context.Initialize(fixed, {dir}, error));
+    SceneBuilder scene;
+    SA_CHECK(scene.Initialize(context, {}));
+    TwoRoomScene fixture;
+    SA_CHECK(scene.AddStaticMesh(fixture.walls, "commit_cadence"));
+    scene.Commit();
+    Simulator simulator;
+    SA_CHECK(simulator.Initialize(context, {}, fixed, error));
+    SimulationThread worker;
+    RuntimeConfig runtime;
+    runtime.simulationIntervalMs = 5000.f;
+    runtime.dynamicUpdateIntervalMs = 100.f;
+    runtime.reflections = runtime.pathing = false;
+    worker.SetRuntimeConfig(runtime);
+    SimulationThreadSetup setup;
+    setup.context = &context;
+    setup.simulator = &simulator;
+    setup.scene = &scene;
+    SA_CHECK(worker.Start(setup));
+    const auto id = worker.AllocDynamicId();
+    SA_CHECK(worker.AddDynamicGeometry(id, std::make_shared<MeshData>(fixture.door), Transform{}, "door"));
+    const auto firstDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (worker.Stats().sceneCommits.load() == 0 && std::chrono::steady_clock::now() < firstDeadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    SA_CHECK(worker.Stats().sceneCommits.load() > 0);
+    const uint64_t before = worker.Stats().sceneCommits.load();
+    SA_CHECK(worker.UpdateDynamicGeometry(id, Transform::FromAngles({128.f, 0.f, 0.f}, {})));
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (worker.Stats().sceneCommits.load() == before && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const bool committed = worker.Stats().sceneCommits.load() > before;
+    worker.Stop();
+    SA_CHECK(committed);
+}
+
 SA_TEST(SimulationThread_PublishesDirectBeforeSlowReflections)
 {
     const char* dir = PhononDir();

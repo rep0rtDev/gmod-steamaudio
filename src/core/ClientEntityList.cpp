@@ -341,6 +341,8 @@ bool ClientEntityList::Initialize(const EntityListConfig& config, std::string& e
 
 void ClientEntityList::Shutdown()
 {
+    CancelSnapshot();
+    m_snapshotMap.clear();
     m_entityList = nullptr;
     m_modelInfo = nullptr;
     m_client.reset();
@@ -353,8 +355,18 @@ void ClientEntityList::Shutdown()
 
 void ClientEntityList::Invalidate()
 {
+    CancelSnapshot();
+    m_snapshotMap.clear();
     if (m_state == State::Validated)
         m_state = State::Unvalidated;
+}
+
+void ClientEntityList::CancelSnapshot()
+{
+    m_sweep.Reset();
+    m_snapshotSlices = 0;
+    m_stats.scanPending = false;
+    m_stats.nextIndex = 0;
 }
 
 bool ClientEntityList::SlotsPlausible(std::string& why) const
@@ -436,23 +448,38 @@ bool ClientEntityList::Validate(const std::string& mapName, int32_t localPlayer,
 
 bool ClientEntityList::Snapshot(const std::string& mapName, int32_t localPlayer, std::vector<EntitySnapshot>& out)
 {
+    SnapshotResult result;
+    do {
+        result = PollSnapshot(mapName, localPlayer, out, 8.f);
+    } while (result == SnapshotResult::Pending);
+    return result == SnapshotResult::Complete;
+}
+
+ClientEntityList::SnapshotResult ClientEntityList::PollSnapshot(const std::string& mapName, int32_t localPlayer,
+                                                                std::vector<EntitySnapshot>& out, float budgetMs)
+{
+    const auto sliceStart = std::chrono::steady_clock::now();
     out.clear();
     if (m_state == State::Uninitialized || m_state == State::Failed || !m_entityList)
-        return false;
+        return SnapshotResult::Unavailable;
+    if (m_snapshotMap != mapName) {
+        Invalidate();
+        m_snapshotMap = mapName;
+    }
     if (m_state == State::Unvalidated) {
         if (mapName.empty())
-            return false;
+            return SnapshotResult::Unavailable;
         std::string why;
         if (!Validate(mapName, localPlayer, why)) {
             m_error = why;
             if (why == "no entities yet")
-                return false; // not in-game yet; retry later
+                return SnapshotResult::Unavailable; // not in-game yet; retry later
             if (!m_loggedFailure) {
                 SA_LOGW("[ents] native entity list layout rejected: %s (Lua fallback stays active)", why.c_str());
                 m_loggedFailure = true;
             }
             m_state = State::Failed;
-            return false;
+            return SnapshotResult::Unavailable;
         }
         m_state = State::Validated;
         m_error.clear();
@@ -462,7 +489,8 @@ bool ClientEntityList::Snapshot(const std::string& mapName, int32_t localPlayer,
     if (!m_client || !m_engine) {
         m_error = "module image unavailable";
         m_state = State::Failed;
-        return false;
+        CancelSnapshot();
+        return SnapshotResult::Unavailable;
     }
     ReaderContext ctx;
     ctx.entityList = m_entityList;
@@ -472,31 +500,31 @@ bool ClientEntityList::Snapshot(const std::string& mapName, int32_t localPlayer,
     ctx.engine = &*m_engine;
     ctx.skipDormantGeometry = true;
 
-    const int32_t highest = ReadHighestIndex(ctx);
-    if (highest < 0 || highest > m_config.maxEntities) {
-        m_error = "GetHighestEntityIndex() implausible: " + std::to_string(highest);
-        SA_LOGW("[ents] %s; disabling native walk", m_error.c_str());
-        m_state = State::Failed;
-        return false;
-    }
-    ++m_stats.snapshots;
-    m_stats.lastHighestIndex = highest;
-    out.reserve(static_cast<size_t>(highest));
-    uint64_t faults = 0;
-    RawEntity raw;
-    for (int32_t i = 1; i <= highest; ++i) {
-        ++m_stats.entitiesVisited;
-        raw = RawEntity{};
-        const int32_t rc = ReadEntity(ctx, i, raw);
-        if (rc == kReadNull)
-            continue;
-        if (rc == kReadFault) {
-            ++faults;
-            ++m_stats.readFailures;
-            continue;
+    if (!m_sweep.InProgress()) {
+        const int32_t highest = ReadHighestIndex(ctx);
+        if (highest < 0 || highest > m_config.maxEntities) {
+            m_error = "GetHighestEntityIndex() implausible: " + std::to_string(highest);
+            SA_LOGW("[ents] %s; disabling native walk", m_error.c_str());
+            m_state = State::Failed;
+            return SnapshotResult::Unavailable;
         }
-        EntitySnapshot e;
-        e.index = i;
+        m_sweep.Begin(highest);
+        m_snapshotStart = sliceStart;
+        m_snapshotSlices = 0;
+        m_stats.lastHighestIndex = highest;
+    }
+    const float budget = std::isfinite(budgetMs) ? std::clamp(budgetMs, 0.25f, 8.f) : 2.f;
+    const auto deadline = sliceStart + std::chrono::microseconds(static_cast<int64_t>(budget * 1000.f));
+    const auto read = [&](int32_t index, EntitySnapshot& e) {
+        ++m_stats.entitiesVisited;
+        RawEntity raw;
+        const int32_t rc = ReadEntity(ctx, index, raw);
+        if (rc == kReadNull)
+            return EntitySnapshotSweep::ReadResult::Missing;
+        if (rc == kReadFault) {
+            ++m_stats.readFailures;
+            return EntitySnapshotSweep::ReadResult::Fault;
+        }
         e.model = raw.model;
         e.origin = Vec3{raw.origin[0], raw.origin[1], raw.origin[2]};
         e.angles = Vec3{raw.angles[0], raw.angles[1], raw.angles[2]};
@@ -509,19 +537,34 @@ bool ClientEntityList::Snapshot(const std::string& mapName, int32_t localPlayer,
         const std::string cls = raw.networkName;
         for (const std::string& suffix : m_config.playerClassSuffixes)
             e.player = e.player || EndsWith(cls, suffix);
-        out.push_back(std::move(e));
         ++m_stats.entitiesEmitted;
-    }
+        return EntitySnapshotSweep::ReadResult::Present;
+    };
+    ++m_stats.scanSlices;
+    ++m_snapshotSlices;
+    const bool complete = m_sweep.Advance(read, [&] { return std::chrono::steady_clock::now() < deadline; }, 256, out);
+    m_stats.scanPending = !complete;
+    m_stats.nextIndex = m_sweep.NextIndex();
+    if (!complete)
+        return SnapshotResult::Pending;
+    ++m_stats.snapshots;
+    m_stats.lastSnapshotSlices = m_snapshotSlices;
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - m_snapshotStart).count();
+    m_stats.lastSnapshotMicros = static_cast<uint32_t>(std::min<int64_t>(elapsed, UINT32_MAX));
+    const uint64_t faults = m_sweep.Faults();
+    const int32_t highest = m_sweep.HighestIndex();
     // A layout that faults on a sizeable share of live entities is wrong even
     // if the world/player probes passed.
     if (faults > 8 && faults * 4 > static_cast<uint64_t>(highest)) {
         m_error = std::to_string(faults) + " of " + std::to_string(highest) + " entity reads faulted";
         SA_LOGW("[ents] %s; disabling native walk", m_error.c_str());
         m_state = State::Failed;
+        CancelSnapshot();
         out.clear();
-        return false;
+        return SnapshotResult::Unavailable;
     }
-    return true;
+    return SnapshotResult::Complete;
 }
 
 } // namespace sa

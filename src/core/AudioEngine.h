@@ -216,7 +216,7 @@ public:
     // Reads a game-relative file ("models/x.mdl") the way the game resolves it:
     // engine file system first, then the loose game directory, then GMAs.
     bool ReadGameFile(const std::string& relativePath, std::vector<uint8_t>& out, std::string& error,
-                      std::string* resolvedBy = nullptr);
+                      std::string* resolvedBy = nullptr, bool fallbackOnEngineMiss = true);
     bool GameFileExists(const std::string& relativePath);
     const EngineFileSystem& FileSystem() const { return m_fileSystem; }
     const std::string& FileSystemStatus() const { return m_fileSystemStatus; }

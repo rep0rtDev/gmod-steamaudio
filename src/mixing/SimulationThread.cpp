@@ -65,6 +65,7 @@ bool SimulationThread::Start(const SimulationThreadSetup& setup)
     m_tick = 0;
     m_lastReflectionsTime = std::chrono::steady_clock::time_point{};
     m_lastPathingTime = std::chrono::steady_clock::time_point{};
+    m_nextGeometryCommit = std::chrono::steady_clock::time_point{};
     m_shared = IPLSimulationSharedInputs{};
     m_cfg = m_runtime.Load();
     m_stats.lastTickMicros.store(0, std::memory_order_relaxed);
@@ -259,7 +260,8 @@ void SimulationThread::Run()
         const auto tickStart = std::chrono::steady_clock::now();
         const uint64_t revision = m_setup.capture ? m_setup.capture->SourceRevision() : 0;
         const bool urgent = revision != sourceRevision || m_pendingCommands.load(std::memory_order_acquire) != 0 ||
-                            m_cancelBakeRequested.load(std::memory_order_acquire);
+                            m_cancelBakeRequested.load(std::memory_order_acquire) ||
+                            (m_sceneDirty && tickStart >= m_nextGeometryCommit);
         if (tickStart >= nextTick || urgent) {
             sourceRevision = revision;
             Tick();
@@ -272,8 +274,9 @@ void SimulationThread::Run()
             nextTick = tickStart + std::chrono::microseconds(
                 static_cast<int64_t>(std::max(5.f, m_cfg.simulationIntervalMs) * 1000.f));
         }
+        const auto nextWake = m_sceneDirty ? std::min(nextTick, m_nextGeometryCommit) : nextTick;
         const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
-            nextTick - std::chrono::steady_clock::now());
+            nextWake - std::chrono::steady_clock::now());
         const auto sleepFor = remaining.count() <= 0 ? std::chrono::microseconds(1000)
                               : m_setup.capture ? std::min(remaining, std::chrono::microseconds(5000)) : remaining;
         std::unique_lock<std::mutex> lock(m_wakeMutex);
@@ -336,13 +339,19 @@ void SimulationThread::Tick()
     }
 
     // 2. Geometry.
-    const bool geometryChanged = m_sceneDirty && m_setup.scene && m_setup.scene->IsValid() &&
-                                 m_setup.scene->HasPendingChanges();
-    m_sceneDirty = false;
+    const bool scenePending = m_sceneDirty && m_setup.scene && m_setup.scene->IsValid() &&
+                              m_setup.scene->HasPendingChanges();
+    const bool geometryChanged = scenePending && std::chrono::steady_clock::now() >= m_nextGeometryCommit;
+    m_sceneDirty = scenePending;
     if (geometryChanged) {
         const auto commitStart = std::chrono::steady_clock::now();
         m_setup.scene->Commit();
         const uint32_t commitMicros = MicrosSince(commitStart);
+        m_sceneDirty = false;
+        const float intervalMs = std::isfinite(m_cfg.dynamicUpdateIntervalMs)
+                                     ? Clamp(m_cfg.dynamicUpdateIntervalMs, 16.f, 5000.f) : 100.f;
+        m_nextGeometryCommit = std::chrono::steady_clock::now() +
+                               std::chrono::microseconds(static_cast<int64_t>(intervalMs * 1000.f));
         m_stats.lastSceneCommitMicros.store(commitMicros, std::memory_order_relaxed);
         m_stats.maxSceneCommitMicros.store(
             std::max(commitMicros, m_stats.maxSceneCommitMicros.load(std::memory_order_relaxed)),
@@ -352,8 +361,8 @@ void SimulationThread::Tick()
                                       std::memory_order_relaxed);
         m_stats.dynamicMeshes.store(static_cast<uint32_t>(m_setup.scene->DynamicCount()), std::memory_order_relaxed);
     }
-    if (m_bakeRequested && m_setup.reflections && m_setup.scene && m_setup.scene->StaticTriangleCount() > 0 &&
-        !m_setup.reflections->BakeInProgress()) {
+    if (m_bakeRequested && !m_sceneDirty && m_setup.reflections && m_setup.scene &&
+        m_setup.scene->StaticTriangleCount() > 0 && !m_setup.reflections->BakeInProgress()) {
         StartBakeForCurrentMap(m_bakeForce);
         m_bakeRequested = false;
     }
@@ -630,17 +639,21 @@ void SimulationThread::HandleCommand(Command& cmd)
     case Command::Type::AddStatic: {
         if (!m_setup.scene || !m_setup.scene->IsValid() || !cmd.mesh)
             break;
-        if (m_setup.scene->AddStaticMesh(*cmd.mesh, cmd.name.c_str()))
+        if (m_setup.scene->AddStaticMesh(*cmd.mesh, cmd.name.c_str())) {
             m_sceneDirty = true;
+            m_nextGeometryCommit = std::chrono::steady_clock::time_point{};
+        }
         break;
     }
     case Command::Type::AddDynamic: {
         if (!m_setup.scene || !m_setup.scene->IsValid() || !cmd.mesh)
             break;
+        m_nextGeometryCommit = std::chrono::steady_clock::time_point{};
         auto it = m_dynamic.find(cmd.id);
         if (it != m_dynamic.end()) {
             m_setup.scene->RemoveDynamic(it->second.sceneId);
             m_dynamic.erase(it);
+            m_sceneDirty = true;
         }
         CoordinateConverter converter;
         converter.SetUnitsPerMeter(m_cfg.unitsPerMeter);
@@ -677,9 +690,11 @@ void SimulationThread::HandleCommand(Command& cmd)
         m_setup.scene->RemoveDynamic(it->second.sceneId);
         m_dynamic.erase(it);
         m_sceneDirty = true;
+        m_nextGeometryCommit = std::chrono::steady_clock::time_point{};
         break;
     }
     case Command::Type::ClearGeometry: {
+        m_nextGeometryCommit = std::chrono::steady_clock::time_point{};
         if (m_setup.reflections) {
             m_setup.reflections->CancelBake();
             while (m_setup.reflections->BakeInProgress())
@@ -713,6 +728,7 @@ void SimulationThread::HandleCommand(Command& cmd)
 
 void SimulationThread::ApplyMapGeometry(const BspGeometry& geometry)
 {
+    m_nextGeometryCommit = std::chrono::steady_clock::time_point{};
     if (!geometry.world.Empty()) {
         if (m_setup.scene->AddStaticMesh(geometry.world, geometry.mapName.c_str()))
             SA_LOGI("[sim] world geometry: %zu triangles, %zu vertices", geometry.world.triangles.size(),

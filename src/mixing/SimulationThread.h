@@ -222,6 +222,7 @@ private:
     uint64_t m_lastPathingTick = 0;
     std::chrono::steady_clock::time_point m_lastReflectionsTime{};
     std::chrono::steady_clock::time_point m_lastPathingTime{};
+    std::chrono::steady_clock::time_point m_nextGeometryCommit{};
     IPLSimulationSharedInputs m_shared{};
     SimulationThreadStats m_stats;
 };

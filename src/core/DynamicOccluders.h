@@ -27,6 +27,7 @@
 // through IDynamicGeometrySink (SimulationThread command queue).
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -71,6 +72,7 @@ struct DynamicOccluderOptions {
     float rangeUnits = 3000.f;      // snd_sa_dynamic_range; <= 0 => unlimited
     float minExtentUnits = 8.f;     // snd_sa_dynamic_min_size (largest OBB side)
     int32_t modelLoadsPerUpdate = 2;
+    float modelLoadBudgetMs = 0.f;
     size_t maxModelCache = 512;
     size_t maxModelTriangles = 16384; // larger collision meshes are box-approximated
     float positionEpsilonUnits = 0.5f;
@@ -115,6 +117,12 @@ public:
         uint64_t removed = 0;
         uint64_t transformUpdates = 0;
         uint64_t brushUpdates = 0;
+        uint64_t modelLoads = 0;
+        uint64_t modelBudgetDeferrals = 0;
+        uint32_t lastModelLoadMicros = 0;
+        uint32_t maxModelLoadMicros = 0;
+        uint32_t lastFileReadMicros = 0;
+        uint32_t maxFileReadMicros = 0;
     };
 
     struct TrackedInfo {
@@ -144,6 +152,7 @@ public:
     // scene. `listenerValid == false` disables the range/inside filters.
     void Update(const std::vector<EntitySnapshot>& entities, const Vec3& listener, bool listenerValid,
                 IDynamicGeometrySink& sink);
+    void RefreshTransforms(const std::vector<EntitySnapshot>& entities, IDynamicGeometrySink& sink);
 
     // Removes every tracked mesh (map unload / disable). Keeps the model cache.
     void Clear(IDynamicGeometrySink& sink);
@@ -225,6 +234,7 @@ private:
     Vec3 m_playerBoxMins{}, m_playerBoxMaxs{};
     IPLMaterial m_defaultMaterial{};
     Stats m_stats;
+    std::chrono::steady_clock::time_point m_modelDeadline = std::chrono::steady_clock::time_point::max();
 };
 
 // Default Source player standing hull.

@@ -78,6 +78,8 @@
     "dynamic_range_units": 3000,
     "dynamic_min_extent_units": 8,
     "dynamic_update_interval_ms": 100,
+    "dynamic_scan_budget_ms": 2.0,
+    "dynamic_model_budget_ms": 2.0,
     "static_props": true,
     "static_prop_box_fallback": true,
     "vmt_surfaceprops": true,
