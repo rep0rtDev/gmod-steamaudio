@@ -67,6 +67,12 @@ bool SimulationThread::Start(const SimulationThreadSetup& setup)
     m_lastPathingTime = std::chrono::steady_clock::time_point{};
     m_shared = IPLSimulationSharedInputs{};
     m_cfg = m_runtime.Load();
+    m_stats.lastTickMicros.store(0, std::memory_order_relaxed);
+    m_stats.maxTickMicros.store(0, std::memory_order_relaxed);
+    m_stats.lastCommandMicros.store(0, std::memory_order_relaxed);
+    m_stats.maxCommandMicros.store(0, std::memory_order_relaxed);
+    m_stats.lastSceneCommitMicros.store(0, std::memory_order_relaxed);
+    m_stats.maxSceneCommitMicros.store(0, std::memory_order_relaxed);
 
     m_running.store(true, std::memory_order_release);
     m_thread = std::thread([this] { Run(); });
@@ -258,6 +264,7 @@ void SimulationThread::Run()
             sourceRevision = revision;
             Tick();
             const uint32_t elapsed = MicrosSince(tickStart);
+            m_stats.lastTickMicros.store(elapsed, std::memory_order_relaxed);
             uint32_t prevMax = m_stats.maxTickMicros.load(std::memory_order_relaxed);
             while (elapsed > prevMax &&
                    !m_stats.maxTickMicros.compare_exchange_weak(prevMax, elapsed, std::memory_order_relaxed)) {
@@ -306,7 +313,12 @@ void SimulationThread::Tick()
     m_cfg = m_runtime.Load();
     const auto idleCutoff = std::chrono::steady_clock::now() - std::chrono::microseconds(
         static_cast<int64_t>(kIdleTicksBeforeRetire * std::max(5.f, m_cfg.simulationIntervalMs) * 1000.f));
+    const auto commandsStart = std::chrono::steady_clock::now();
     DrainCommands();
+    const uint32_t commandsMicros = MicrosSince(commandsStart);
+    m_stats.lastCommandMicros.store(commandsMicros, std::memory_order_relaxed);
+    m_stats.maxCommandMicros.store(std::max(commandsMicros, m_stats.maxCommandMicros.load(std::memory_order_relaxed)),
+                                    std::memory_order_relaxed);
     if (m_cancelBakeRequested.exchange(false, std::memory_order_acq_rel)) {
         m_bakeRequested = false;
         if (m_setup.reflections)
@@ -324,10 +336,17 @@ void SimulationThread::Tick()
     }
 
     // 2. Geometry.
-    const bool geometryChanged = m_sceneDirty && m_setup.scene && m_setup.scene->IsValid();
+    const bool geometryChanged = m_sceneDirty && m_setup.scene && m_setup.scene->IsValid() &&
+                                 m_setup.scene->HasPendingChanges();
+    m_sceneDirty = false;
     if (geometryChanged) {
+        const auto commitStart = std::chrono::steady_clock::now();
         m_setup.scene->Commit();
-        m_sceneDirty = false;
+        const uint32_t commitMicros = MicrosSince(commitStart);
+        m_stats.lastSceneCommitMicros.store(commitMicros, std::memory_order_relaxed);
+        m_stats.maxSceneCommitMicros.store(
+            std::max(commitMicros, m_stats.maxSceneCommitMicros.load(std::memory_order_relaxed)),
+            std::memory_order_relaxed);
         m_stats.sceneCommits.fetch_add(1, std::memory_order_relaxed);
         m_stats.staticTriangles.store(static_cast<uint32_t>(m_setup.scene->StaticTriangleCount()),
                                       std::memory_order_relaxed);

@@ -345,6 +345,31 @@ SA_TEST(DynOcc_MissingModelFallsBackToEntityBoxOrSkips)
     SA_CHECK_EQ(strict.GetStats().tracked, size_t(0));
 }
 
+SA_TEST(DynOcc_DormantSnapshotsNeedNoGeometryDetails)
+{
+    Files files;
+    files.files["models/drum.phy"] = DrumPhy();
+    DynamicOccluders occ;
+    occ.Configure(Options());
+    occ.SetReader(files.Reader());
+    FakeSink sink;
+    const EntitySnapshot active = Prop(12, "models/drum.mdl", {200.f, 0.f, 0.f});
+    occ.Update({active}, {}, true, sink);
+    SA_CHECK_EQ(sink.Alive(), size_t(1));
+    const int reads = files.reads;
+    EntitySnapshot dormant;
+    dormant.index = active.index;
+    dormant.dormant = true;
+    occ.Update({dormant}, {}, true, sink);
+    SA_CHECK_EQ(sink.Alive(), size_t(1));
+    SA_CHECK_EQ(files.reads, reads);
+    occ.Update({dormant}, {}, true, sink);
+    SA_CHECK_EQ(sink.Alive(), size_t(0));
+    occ.Update({active}, {}, true, sink);
+    SA_CHECK_EQ(sink.Alive(), size_t(1));
+    SA_CHECK_EQ(files.reads, reads);
+}
+
 SA_TEST(DynOcc_PlayersUseHullAndLocalPlayerExcluded)
 {
     DynamicOccluders occ;

@@ -20,6 +20,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <optional>
 #include <string>
 #include <vector>
@@ -69,6 +70,7 @@ ModuleImage MakeBufferImage(const void* data, size_t size, const std::string& se
 // Best-effort check that [address, address+length) is committed readable
 // memory. Uses VirtualQuery on Windows.
 bool IsMemoryReadable(uintptr_t address, size_t length);
+bool HasCodeVTableSlots(const void* object, const ModuleImage& image, std::initializer_list<int32_t> slots);
 
 struct Pattern {
     std::vector<uint8_t> bytes;

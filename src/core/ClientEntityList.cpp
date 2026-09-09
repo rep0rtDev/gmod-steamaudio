@@ -46,6 +46,7 @@ struct ReaderContext {
     const EntityListSlots* slots = nullptr;
     const ModuleImage* client = nullptr;
     const ModuleImage* engine = nullptr;
+    bool skipDormantGeometry = false;
 };
 
 enum ReadResult : int32_t { kReadOk = 0, kReadNull = 1, kReadFault = 2 };
@@ -54,16 +55,7 @@ enum ReadResult : int32_t { kReadOk = 0, kReadNull = 1, kReadFault = 2 };
 // code inside `image`.
 bool SlotIsCode(const void* object, int32_t slot, const ModuleImage& image)
 {
-    if (!object || slot < 0 || slot >= kMaxSlot)
-        return false;
-    const auto objAddr = reinterpret_cast<uintptr_t>(object);
-    if (!IsMemoryReadable(objAddr, sizeof(void*)))
-        return false;
-    const uintptr_t vtable = *reinterpret_cast<const uintptr_t*>(objAddr);
-    if (vtable == 0 || !IsMemoryReadable(vtable, static_cast<size_t>(slot + 1) * sizeof(void*)))
-        return false;
-    const uintptr_t fn = reinterpret_cast<const uintptr_t*>(vtable)[slot];
-    return image.IsCodeAddress(fn);
+    return HasCodeVTableSlots(object, image, {slot});
 }
 
 bool ReadVec3(const void* ptr, float out[3])
@@ -103,14 +95,16 @@ int32_t ReadEntityUnguarded(const ReaderContext& ctx, int32_t index, RawEntity& 
     void* entity = CallVirtual<void*>(ctx.entityList, s.getClientEntity, index);
     if (!entity)
         return kReadNull;
-    if (!SlotIsCode(entity, s.getCollideable, *ctx.client) || !SlotIsCode(entity, s.getClientNetworkable, *ctx.client))
+    if (!HasCodeVTableSlots(entity, *ctx.client, {s.getCollideable, s.getClientNetworkable}))
         return kReadFault;
 
     void* networkable = CallVirtual<void*>(entity, s.getClientNetworkable);
     if (networkable) {
-        if (!SlotIsCode(networkable, s.isDormant, *ctx.client) || !SlotIsCode(networkable, s.getClientClass, *ctx.client))
+        if (!HasCodeVTableSlots(networkable, *ctx.client, {s.isDormant, s.getClientClass}))
             return kReadFault;
         out.dormant = CallVirtual<bool>(networkable, s.isDormant) ? 1 : 0;
+        if (out.dormant && ctx.skipDormantGeometry)
+            return kReadOk;
         const void* clientClass = CallVirtual<const void*>(networkable, s.getClientClass);
         if (clientClass) {
             const auto ccAddr = reinterpret_cast<uintptr_t>(clientClass);
@@ -125,10 +119,8 @@ int32_t ReadEntityUnguarded(const ReaderContext& ctx, int32_t index, RawEntity& 
     void* collideable = CallVirtual<void*>(entity, s.getCollideable);
     if (!collideable)
         return kReadNull;
-    if (!SlotIsCode(collideable, s.getCollisionOrigin, *ctx.client) ||
-        !SlotIsCode(collideable, s.getCollisionAngles, *ctx.client) ||
-        !SlotIsCode(collideable, s.getCollisionModel, *ctx.client) || !SlotIsCode(collideable, s.getSolid, *ctx.client) ||
-        !SlotIsCode(collideable, s.obbMins, *ctx.client) || !SlotIsCode(collideable, s.obbMaxs, *ctx.client))
+    if (!HasCodeVTableSlots(collideable, *ctx.client, {s.getCollisionOrigin, s.getCollisionAngles,
+                                                     s.getCollisionModel, s.getSolid, s.obbMins, s.obbMaxs}))
         return kReadFault;
 
     const float* origin = CallVirtual<const float*>(collideable, s.getCollisionOrigin);
@@ -478,6 +470,7 @@ bool ClientEntityList::Snapshot(const std::string& mapName, int32_t localPlayer,
     ctx.slots = &m_config.slots;
     ctx.client = &*m_client;
     ctx.engine = &*m_engine;
+    ctx.skipDormantGeometry = true;
 
     const int32_t highest = ReadHighestIndex(ctx);
     if (highest < 0 || highest > m_config.maxEntities) {

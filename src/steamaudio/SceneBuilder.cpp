@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstring>
 
 #include "PhononContext.h"
 #include "steamaudio/SurfaceProps.h"
@@ -559,9 +560,9 @@ SceneBuilder::DynamicId SceneBuilder::AddDynamic(const MeshData& localMesh, cons
 
     DynamicEntry entry;
     entry.name = debugName ? debugName : "";
+    entry.transform = transform;
     if (m_sceneSettings.type == IPL_SCENETYPE_RADEONRAYS) {
         entry.flattenedLocalMesh = std::make_unique<MeshData>(localMesh);
-        entry.transform = transform;
         if (!RebuildFlattenedDynamic(entry))
             return kInvalidDynamic;
         const DynamicId id = m_nextDynamic++;
@@ -607,10 +608,10 @@ SceneBuilder::DynamicId SceneBuilder::AddDynamic(const MeshData& localMesh, cons
 void SceneBuilder::UpdateDynamic(DynamicId id, const IPLMatrix4x4& transform)
 {
     auto it = m_dynamic.find(id);
-    if (it == m_dynamic.end() || !m_scene)
+    if (it == m_dynamic.end() || !m_scene || std::memcmp(&it->second.transform, &transform, sizeof(transform)) == 0)
         return;
+    it->second.transform = transform;
     if (it->second.flattenedLocalMesh) {
-        it->second.transform = transform;
         it->second.transformDirty = true;
     } else {
         iplInstancedMeshUpdateTransform(it->second.instance, m_scene, transform);

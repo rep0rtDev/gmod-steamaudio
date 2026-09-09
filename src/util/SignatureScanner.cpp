@@ -167,6 +167,33 @@ bool IsMemoryReadable(uintptr_t address, size_t length)
 // Pattern
 // ---------------------------------------------------------------------------
 
+bool HasCodeVTableSlots(const void* object, const ModuleImage& image, std::initializer_list<int32_t> slots)
+{
+    if (!object || slots.size() == 0)
+        return false;
+    int32_t highest = 0;
+    for (int32_t slot : slots) {
+        if (slot < 0 || slot >= 256)
+            return false;
+        highest = std::max(highest, slot);
+    }
+    const uintptr_t address = reinterpret_cast<uintptr_t>(object);
+    if (!IsMemoryReadable(address, sizeof(uintptr_t)))
+        return false;
+    uintptr_t table = 0;
+    std::memcpy(&table, object, sizeof(table));
+    if (!IsMemoryReadable(table, (static_cast<size_t>(highest) + 1) * sizeof(uintptr_t)))
+        return false;
+    for (int32_t slot : slots) {
+        uintptr_t function = 0;
+        std::memcpy(&function, reinterpret_cast<const void*>(table + static_cast<size_t>(slot) * sizeof(uintptr_t)),
+                    sizeof(function));
+        if (!image.IsCodeAddress(function))
+            return false;
+    }
+    return true;
+}
+
 std::optional<Pattern> Pattern::Parse(const std::string& idaStyle)
 {
     Pattern p;

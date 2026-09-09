@@ -688,6 +688,16 @@ SA_TEST(HrtfRenderer_TwoRoomsRespectDoorAndMaterial)
     const auto door = scene.AddDynamic(fixture.door, converter.TransformToSA(Transform{}), "door");
     SA_CHECK(door != SceneBuilder::kInvalidDynamic);
     scene.Commit();
+    scene.UpdateDynamic(door, converter.TransformToSA(Transform{}));
+    SA_CHECK(!scene.HasPendingChanges());
+    const auto movedDoor = converter.TransformToSA(Transform::FromAngles({128.f, 0.f, 0.f}, {}));
+    scene.UpdateDynamic(door, movedDoor);
+    SA_CHECK(scene.HasPendingChanges());
+    scene.Commit();
+    scene.UpdateDynamic(door, movedDoor);
+    SA_CHECK(!scene.HasPendingChanges());
+    scene.UpdateDynamic(door, converter.TransformToSA(Transform{}));
+    scene.Commit();
     Simulator simulator;
     SA_CHECK(simulator.Initialize(context, devices, fixed, error));
     simulator.SetScene(scene.Scene());

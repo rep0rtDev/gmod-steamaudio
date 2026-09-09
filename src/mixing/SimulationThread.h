@@ -73,6 +73,11 @@ struct SimulationThreadStats {
     std::atomic<uint32_t> lastDirectMicros{0};
     std::atomic<uint32_t> lastReflectionMicros{0};
     std::atomic<uint32_t> lastPathingMicros{0};
+    std::atomic<uint32_t> lastTickMicros{0};
+    std::atomic<uint32_t> lastCommandMicros{0};
+    std::atomic<uint32_t> maxCommandMicros{0};
+    std::atomic<uint32_t> lastSceneCommitMicros{0};
+    std::atomic<uint32_t> maxSceneCommitMicros{0};
     std::atomic<uint32_t> maxTickMicros{0};
     std::atomic<uint32_t> staticTriangles{0};
     std::atomic<uint32_t> dynamicMeshes{0};

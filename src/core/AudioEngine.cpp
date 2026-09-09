@@ -35,6 +35,14 @@ constexpr uint32_t kMaxDeviceRetries = 5;
 constexpr size_t kEngineSlotRingSeconds = 2;
 constexpr size_t kMaxStreamSources = 256;
 
+void RecordTiming(std::chrono::steady_clock::time_point start, uint32_t& last, uint32_t& peak)
+{
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    last = static_cast<uint32_t>(std::clamp<int64_t>(elapsed, 0, std::numeric_limits<uint32_t>::max()));
+    peak = std::max(peak, last);
+}
+
 const char* SceneTypeName(IPLSceneType type)
 {
     switch (type) {
@@ -877,6 +885,9 @@ void AudioEngine::Shutdown()
     m_output.reset();
     m_state = EngineState::Uninitialized;
     m_stateReason.clear();
+    m_gameTickMicros = m_maxGameTickMicros = 0;
+    m_entitySnapshotMicros = m_maxEntitySnapshotMicros = 0;
+    m_occluderUpdateMicros = m_maxOccluderUpdateMicros = 0;
     log::FlushRTCounters();
     log::Shutdown();
 }
@@ -1040,6 +1051,7 @@ void AudioEngine::Tick(float frameTime)
 {
     if (m_state == EngineState::Uninitialized || m_state == EngineState::Inactive)
         return;
+    const auto tickStart = std::chrono::steady_clock::now();
     frameTime = Clamp(frameTime, 0.f, 1.f);
 
     if (m_hooksInstalled) {
@@ -1089,6 +1101,7 @@ void AudioEngine::Tick(float frameTime)
     }
     DrainClockEvents();
     DrainSourceEnds();
+    RecordTiming(tickStart, m_gameTickMicros, m_maxGameTickMicros);
 }
 
 void AudioEngine::DrainSourceEnds()
@@ -1551,14 +1564,19 @@ void AudioEngine::UpdateDynamicOccluders(float frameTime)
     if (rt.nativeEntityList && m_entityList.GetState() != ClientEntityList::State::Failed &&
         m_entityList.GetState() != ClientEntityList::State::Uninitialized) {
         m_entityScratch.clear();
-        if (m_entityList.Snapshot(m_mapName, m_localPlayer, m_entityScratch)) {
+        const auto snapshotStart = std::chrono::steady_clock::now();
+        const bool snapshotReady = m_entityList.Snapshot(m_mapName, m_localPlayer, m_entityScratch);
+        RecordTiming(snapshotStart, m_entitySnapshotMicros, m_maxEntitySnapshotMicros);
+        if (snapshotReady) {
             if (!m_nativeEntitiesActive) {
                 SA_LOGI("[ents] native entity walk validated (%s); Lua entity walk no longer needed",
                         m_entityList.Description().c_str());
                 m_nativeEntitiesActive = true;
             }
             m_luaBatchReady = false;
+            const auto updateStart = std::chrono::steady_clock::now();
             m_occluders.Update(m_entityScratch, listener, listenerValid, sink);
+            RecordTiming(updateStart, m_occluderUpdateMicros, m_maxOccluderUpdateMicros);
             return;
         }
         if (m_nativeEntitiesActive) {
@@ -1572,7 +1590,9 @@ void AudioEngine::UpdateDynamicOccluders(float frameTime)
 
     if (m_luaBatchReady) {
         m_luaBatchReady = false;
+        const auto updateStart = std::chrono::steady_clock::now();
         m_occluders.Update(m_luaEntitiesReady, listener, listenerValid, sink);
+        RecordTiming(updateStart, m_occluderUpdateMicros, m_maxOccluderUpdateMicros);
     }
 }
 
@@ -1687,6 +1707,19 @@ EngineStatus AudioEngine::Status() const
     s.simulationMicros = sim.lastDirectMicros.load(std::memory_order_relaxed) +
                          sim.lastReflectionMicros.load(std::memory_order_relaxed) +
                          sim.lastPathingMicros.load(std::memory_order_relaxed);
+    s.simulationTickMicros = sim.lastTickMicros.load(std::memory_order_relaxed);
+    s.maxSimulationTickMicros = sim.maxTickMicros.load(std::memory_order_relaxed);
+    s.simulationCommandMicros = sim.lastCommandMicros.load(std::memory_order_relaxed);
+    s.maxSimulationCommandMicros = sim.maxCommandMicros.load(std::memory_order_relaxed);
+    s.sceneCommitMicros = sim.lastSceneCommitMicros.load(std::memory_order_relaxed);
+    s.maxSceneCommitMicros = sim.maxSceneCommitMicros.load(std::memory_order_relaxed);
+    s.sceneCommits = sim.sceneCommits.load(std::memory_order_relaxed);
+    s.gameTickMicros = m_gameTickMicros;
+    s.maxGameTickMicros = m_maxGameTickMicros;
+    s.entitySnapshotMicros = m_entitySnapshotMicros;
+    s.maxEntitySnapshotMicros = m_maxEntitySnapshotMicros;
+    s.occluderUpdateMicros = m_occluderUpdateMicros;
+    s.maxOccluderUpdateMicros = m_maxOccluderUpdateMicros;
     s.staticTriangles = sim.staticTriangles.load(std::memory_order_relaxed);
     s.dynamicMeshes = sim.dynamicMeshes.load(std::memory_order_relaxed);
     if (m_geometry) {

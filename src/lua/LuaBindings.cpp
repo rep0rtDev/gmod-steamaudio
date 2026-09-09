@@ -256,6 +256,19 @@ LUA_FUNCTION(L_GetStatus)
     SetFieldNumber(LUA, "simulation_ticks", static_cast<double>(s.simulationTicks));
     SetFieldNumber(LUA, "simulation_sources", s.simulationSources);
     SetFieldNumber(LUA, "simulation_us", s.simulationMicros);
+    SetFieldNumber(LUA, "simulation_tick_us", s.simulationTickMicros);
+    SetFieldNumber(LUA, "simulation_tick_us_max", s.maxSimulationTickMicros);
+    SetFieldNumber(LUA, "simulation_commands_us", s.simulationCommandMicros);
+    SetFieldNumber(LUA, "simulation_commands_us_max", s.maxSimulationCommandMicros);
+    SetFieldNumber(LUA, "scene_commit_us", s.sceneCommitMicros);
+    SetFieldNumber(LUA, "scene_commit_us_max", s.maxSceneCommitMicros);
+    SetFieldNumber(LUA, "scene_commits", static_cast<double>(s.sceneCommits));
+    SetFieldNumber(LUA, "game_tick_us", s.gameTickMicros);
+    SetFieldNumber(LUA, "game_tick_us_max", s.maxGameTickMicros);
+    SetFieldNumber(LUA, "entity_snapshot_us", s.entitySnapshotMicros);
+    SetFieldNumber(LUA, "entity_snapshot_us_max", s.maxEntitySnapshotMicros);
+    SetFieldNumber(LUA, "occluder_update_us", s.occluderUpdateMicros);
+    SetFieldNumber(LUA, "occluder_update_us_max", s.maxOccluderUpdateMicros);
     SetFieldNumber(LUA, "static_triangles", static_cast<double>(s.staticTriangles));
     SetFieldNumber(LUA, "dynamic_meshes", static_cast<double>(s.dynamicMeshes));
     SetFieldNumber(LUA, "static_props", static_cast<double>(s.staticProps));
@@ -378,6 +391,17 @@ LUA_FUNCTION(L_StatusLines)
                   static_cast<unsigned long long>(s.simulationDirectRuns),
                   static_cast<unsigned long long>(s.simulationReflectionRuns),
                   static_cast<unsigned long long>(s.simulationPathingRuns));
+    lines.emplace_back(buf);
+    std::snprintf(buf, sizeof(buf),
+                  "  game timings last/max us: tick %u/%u  entity scan %u/%u  occluder update %u/%u",
+                  s.gameTickMicros, s.maxGameTickMicros, s.entitySnapshotMicros, s.maxEntitySnapshotMicros,
+                  s.occluderUpdateMicros, s.maxOccluderUpdateMicros);
+    lines.emplace_back(buf);
+    std::snprintf(buf, sizeof(buf),
+                  "  sim timings last/max us: tick %u/%u  commands %u/%u  scene commit %u/%u (%llu commits)",
+                  s.simulationTickMicros, s.maxSimulationTickMicros, s.simulationCommandMicros,
+                  s.maxSimulationCommandMicros, s.sceneCommitMicros, s.maxSceneCommitMicros,
+                  static_cast<unsigned long long>(s.sceneCommits));
     lines.emplace_back(buf);
     std::snprintf(buf, sizeof(buf), "  map: %s  %zu static tris, %zu dynamic meshes  baked: %s%s",
                   s.mapName.empty() ? "(none)" : s.mapName.c_str(), s.staticTriangles, s.dynamicMeshes,

@@ -36,6 +36,29 @@ SA_TEST(IsMemoryReadable_RejectsWrappingRanges)
     SA_CHECK(IsMemoryReadable(reinterpret_cast<uintptr_t>(local.data()), local.size()));
 }
 
+SA_TEST(VTableSlots_ValidatesEverySlotInOneLayout)
+{
+    const uint8_t code[16] = {};
+    const auto image = MakeBufferImage(code, sizeof(code));
+    const uintptr_t base = reinterpret_cast<uintptr_t>(code);
+    uintptr_t table[] = {base, base + 1, base + 2, base + 3};
+    const uintptr_t* object = table;
+    SA_CHECK(HasCodeVTableSlots(&object, image, {0, 1, 2, 3}));
+    SA_CHECK(HasCodeVTableSlots(&object, image, {3, 0, 3}));
+    table[2] = 0;
+    SA_CHECK(!HasCodeVTableSlots(&object, image, {0, 1, 2, 3}));
+    SA_CHECK(HasCodeVTableSlots(&object, image, {0, 1, 3}));
+    table[2] = base + sizeof(code);
+    SA_CHECK(!HasCodeVTableSlots(&object, image, {2}));
+    SA_CHECK(!HasCodeVTableSlots(&object, image, {-1, 0}));
+    SA_CHECK(!HasCodeVTableSlots(&object, image, {0, 256}));
+    SA_CHECK(!HasCodeVTableSlots(&object, image, {}));
+    SA_CHECK(!HasCodeVTableSlots(nullptr, image, {0}));
+    SA_CHECK(!HasCodeVTableSlots(&object, MakeBufferImage(code, sizeof(code), ".data", false), {0}));
+    object = nullptr;
+    SA_CHECK(!HasCodeVTableSlots(&object, image, {0}));
+}
+
 SA_TEST(Scanner_FindsPatternsInBuffer)
 {
     std::vector<uint8_t> code(4096, 0x90);

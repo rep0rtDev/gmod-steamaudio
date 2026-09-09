@@ -110,6 +110,19 @@ struct EngineStatus {
     uint64_t simulationPathingRuns = 0;
     uint32_t simulationSources = 0;
     uint32_t simulationMicros = 0;
+    uint32_t simulationTickMicros = 0;
+    uint32_t maxSimulationTickMicros = 0;
+    uint32_t simulationCommandMicros = 0;
+    uint32_t maxSimulationCommandMicros = 0;
+    uint32_t sceneCommitMicros = 0;
+    uint32_t maxSceneCommitMicros = 0;
+    uint64_t sceneCommits = 0;
+    uint32_t gameTickMicros = 0;
+    uint32_t maxGameTickMicros = 0;
+    uint32_t entitySnapshotMicros = 0;
+    uint32_t maxEntitySnapshotMicros = 0;
+    uint32_t occluderUpdateMicros = 0;
+    uint32_t maxOccluderUpdateMicros = 0;
     size_t staticTriangles = 0;
     size_t dynamicMeshes = 0;
     size_t staticProps = 0;
@@ -405,6 +418,12 @@ private:
     bool m_luaBatchReady = false;
     bool m_nativeEntitiesActive = false;
     float m_occluderTimer = 0.f;
+    uint32_t m_gameTickMicros = 0;
+    uint32_t m_maxGameTickMicros = 0;
+    uint32_t m_entitySnapshotMicros = 0;
+    uint32_t m_maxEntitySnapshotMicros = 0;
+    uint32_t m_occluderUpdateMicros = 0;
+    uint32_t m_maxOccluderUpdateMicros = 0;
 };
 
 } // namespace sa
